@@ -1,6 +1,7 @@
 """Universal Telegram media downloader."""
 
 import glob
+import json
 import logging
 import mimetypes
 import os
@@ -280,26 +281,99 @@ async def process_url(url: str, headers: dict[str, str], work_dir: str) -> list[
 
 
 def is_telegram_video(path: str) -> bool:
-    """Return True for MP4 files that should be sent with Telegram's video API."""
     return Path(path).suffix.lower() == ".mp4"
 
 
+def probe_video(path: str) -> tuple[str | None, str | None, str | None]:
+    """Return video codec, audio codec and pixel format using ffprobe."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None, None, None
+
+    result = run_process([
+        ffprobe, "-v", "error", "-show_entries",
+        "stream=codec_type,codec_name,pix_fmt", "-of", "json", path,
+    ], timeout=60)
+    if result.returncode != 0:
+        return None, None, None
+
+    try:
+        streams = json.loads(result.stdout).get("streams", [])
+    except (json.JSONDecodeError, TypeError):
+        return None, None, None
+
+    video = next((s for s in streams if s.get("codec_type") == "video"), {})
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), {})
+    return video.get("codec_name"), audio.get("codec_name"), video.get("pix_fmt")
+
+
+def ensure_telegram_compatible(path: str) -> str:
+    """Remux compatible MP4s; transcode incompatible codecs to H.264/AAC."""
+    if not is_telegram_video(path):
+        return path
+
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg or not ffprobe:
+        logger.warning("ffmpeg/ffprobe unavailable; skipping Telegram compatibility conversion")
+        return path
+
+    video_codec, audio_codec, pix_fmt = probe_video(path)
+    if video_codec == "h264" and audio_codec in {"aac", None} and pix_fmt in {"yuv420p", "yuvj420p", None}:
+        return path
+
+    output = os.path.join(
+        os.path.dirname(path),
+        f"{Path(path).stem}_telegram.mp4",
+    )
+    logger.info(
+        "Normalizing video for Telegram: video=%s audio=%s pix_fmt=%s",
+        video_codec, audio_codec, pix_fmt,
+    )
+
+    result = run_process([
+        ffmpeg, "-y", "-i", path,
+        "-map", "0:v:0", "-map", "0:a?",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        output,
+    ], timeout=DOWNLOAD_TIMEOUT)
+
+    if result.returncode != 0 or not os.path.isfile(output) or os.path.getsize(output) == 0:
+        raise RuntimeError(result.stderr[-2500:] or "FFmpeg Telegram compatibility conversion failed")
+
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return output
+
+
 async def send_media(update: Update, path: str, caption: str) -> None:
-    """Send MP4 as a playable Telegram video; fall back to document if needed."""
-    with open(path, "rb") as media:
-        if is_telegram_video(path):
+    """Send a compatible MP4 as video; use document as a safe fallback."""
+    if is_telegram_video(path):
+        path = ensure_telegram_compatible(path)
+        if is_too_large(path):
+            raise RuntimeError(
+                f"Converted video is too large for Telegram's current bot upload limit ({MAX_FILE_SIZE_MB} MB)."
+            )
+        with open(path, "rb") as media:
             try:
                 await update.message.reply_video(
                     video=media,
                     caption=caption,
                     supports_streaming=True,
-                    width=None,
-                    height=None,
                 )
                 return
             except Exception as exc:
                 logger.warning("Telegram video upload failed, falling back to document: %s", exc)
                 media.seek(0)
+                await update.message.reply_document(document=media, caption=caption)
+                return
+
+    with open(path, "rb") as media:
         await update.message.reply_document(document=media, caption=caption)
 
 
@@ -373,10 +447,11 @@ def main() -> None:
         raise SystemExit("BOT_TOKEN is not set")
 
     logger.info(
-        "Universal downloader starting | cookies=%s | N_m3u8DL-RE=%s | ffmpeg=%s | streamlink=%s",
+        "Universal downloader starting | cookies=%s | N_m3u8DL-RE=%s | ffmpeg=%s | ffprobe=%s | streamlink=%s",
         "YES" if COOKIES_PATH else "NO",
         "YES" if shutil.which("N_m3u8DL-RE") else "NO",
         "YES" if shutil.which("ffmpeg") else "NO",
+        "YES" if shutil.which("ffprobe") else "NO",
         "YES" if streamlink else "NO",
     )
 
