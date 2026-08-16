@@ -29,8 +29,12 @@ kaam karwane ke liye:
    (apna main account mat use karo — heavy automated use se account action-block
    ho sakta hai).
 2. "Get cookies.txt LOCALLY" jaisi browser extension se instagram.com ki cookies
-   export karo, `cookies.txt` naam se is folder mein rakho.
-3. Bot khud detect kar lega agar `cookies.txt` maujood hai.
+   export karo.
+3. Railway par **`COOKIES_FILE` environment variable** set karo. Iska value cookie
+   file ka path hoga (default: `cookies.txt`).
+4. Agar cookies file Railway container mein available nahi hai, to bot usse use nahi
+   kar payega. Cookies ko GitHub public repo mein commit mat karo, kyunki usme live
+   login session ho sakta hai.
 
 Facebook public videos usually bina login ke bhi chal jaate hain.
 
@@ -53,12 +57,13 @@ for a low-traffic personal bot:
 2. Go to [railway.app](https://railway.app) → sign up (no card needed for the trial) →
    **New Project → Deploy from GitHub repo** → pick your repo.
 3. Railway detects the `Dockerfile` automatically and builds it (ffmpeg included).
-4. In the service's **Variables** tab, add `BOT_TOKEN` (and `COOKIES_FILE` /
-   `COOLDOWN_SECONDS` if you want non-default values).
+4. In the service's **Variables** tab, add `BOT_TOKEN`, `COOKIES_FILE`, and optionally
+   `COOLDOWN_SECONDS` / `MAX_FILE_SIZE_MB`.
 5. Deploy. Check the **Logs** tab for `Bot started, polling...`.
-6. If you're using Instagram cookies, add `cookies.txt` to the repo (or Railway's
-   volume) so `COOKIES_FILE` can find it — don't commit it to a **public** repo,
-   since it contains a live login session.
+6. For Instagram cookies, make sure the cookie file is actually available to the
+   Railway container at the path configured by `COOKIES_FILE`. Do not commit live
+   cookies to a public repository; use a secure runtime mechanism or a Railway
+   volume/file mount.
 
 At ~100 requests/day this comfortably stays inside Railway's free monthly credit,
 so it should cost nothing.
