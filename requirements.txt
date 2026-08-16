@@ -1,3 +1,5 @@
 python-telegram-bot>=22.0
+httpx>=0.28.1
 yt-dlp>=2026.7.4
+streamlink>=8.4.0
 gallery-dl>=1.32.0
