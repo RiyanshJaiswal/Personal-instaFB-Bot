@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 # ---- config (env vars, with sane defaults) ---------------------------------
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8652243803:AAGmA2IIbnBM3wq5z-RqDh8AUdGujCuY0a4")  # required
+BOT_TOKEN = os.environ.get("BOT_TOKEN")  # required
 COOKIES_FILE = os.environ.get("COOKIES_FILE", "cookies.txt")  # optional, see README
 MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))  # Telegram bot API cap
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "15"))  # per-user, avoids IG/FB bans
@@ -61,7 +61,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    # basic per-user cooldown so the bot doesn't hammer IG/FB and risk a ban
     now = time.time()
     wait_left = COOLDOWN_SECONDS - (now - _last_request.get(user_id, 0))
     if wait_left > 0:
@@ -88,8 +87,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
         except yt_dlp.utils.DownloadError as e:
-            # common for photo-only carousels ("no video formats found") —
-            # don't give up yet, gallery-dl below may still pull the images
             logger.warning("yt-dlp couldn't get video for %s: %s", url, e)
             info = {}
         except Exception:
@@ -98,11 +95,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         caption = (info.get("description") or "").strip()
-        if len(caption) > 1024:  # Telegram's per-media caption limit
+        if len(caption) > 1024:
             caption = caption[:1021] + "..."
 
-        # find actual downloaded files, in download order — a carousel post
-        # produces one file per video; order is preserved via mtime
         video_exts = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
         video_files = sorted(
             (
@@ -114,8 +109,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         logger.info("Found %d video file(s) for %s", len(video_files), url)
 
-        # gallery-dl handles photos (and any videos yt-dlp already grabbed
-        # are excluded via --filter so nothing downloads twice)
         image_dir = os.path.join(tmp_dir, "images")
         os.makedirs(image_dir, exist_ok=True)
         gdl_cmd = [
@@ -141,10 +134,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             ),
             key=os.path.getmtime,
         )
-        logger.info("Found %d image file(s) for %s", len(image_files), url)
 
-        # fallback caption from gallery-dl's metadata if yt-dlp had none
-        # (e.g. a photo-only post that yt-dlp couldn't extract at all)
         if not caption:
             for meta_path in glob.glob(os.path.join(image_dir, "**", "*.json"), recursive=True):
                 try:
@@ -191,7 +181,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         await update.message.reply_video(video=media_file, caption=caption or None)
             else:
                 media = []
-                for i, f in enumerate(ok_files[:10]):  # Telegram media-group cap
+                for i, f in enumerate(ok_files[:10]):
                     fh = open(f, "rb")
                     opened.append(fh)
                     cap = caption if i == 0 else None
@@ -217,8 +207,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit(
-            "BOT_TOKEN set nahi hai. @BotFather se token lo, phir:\n"
-            "  export BOT_TOKEN=your_token_here"
+            "BOT_TOKEN set nahi hai. @BotFather se token lo, phir Railway Variables mein BOT_TOKEN set karo."
         )
 
     app = (
