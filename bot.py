@@ -1,5 +1,7 @@
 """Instagram/Facebook media downloader bot."""
+
 import glob
+import json
 import logging
 import mimetypes
 import os
@@ -14,7 +16,7 @@ from urllib.parse import urlparse
 
 import httpx
 import yt_dlp
-from telegram import Update
+from telegram import InputMediaPhoto, Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 try:
@@ -30,7 +32,11 @@ COOKIES_FILE = os.environ.get("COOKIES_FILE", "").strip()
 MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "120"))
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "5"))
 DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "1800"))
-DEFAULT_USER_AGENT = os.environ.get("DEFAULT_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36")
+DEFAULT_USER_AGENT = os.environ.get(
+    "DEFAULT_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+)
 URL_RE = re.compile(r"^https?://\S+$", re.I)
 MANIFEST_RE = re.compile(r"\.(m3u8|m3u|mpd)(?:$|[?#])", re.I)
 VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".ts"}
@@ -48,6 +54,7 @@ def prepare_cookies_file() -> str | None:
         return COOKIES_FILE
     value = COOKIES_FILE
     if not ("# Netscape HTTP Cookie File" in value or "# HTTP Cookie File" in value or ("instagram.com" in value and "\t" in value)):
+        logger.warning("COOKIES_FILE is set but no valid cookies.txt content was detected")
         return None
     path = os.path.join(tempfile.gettempdir(), "bot_cookies.txt")
     try:
@@ -96,7 +103,14 @@ def is_video(path: str) -> bool:
     return Path(path).suffix.lower() in VIDEO_EXTENSIONS
 
 
-def caption_from_path(path: str) -> str:
+def clean_caption(value: str | None, fallback: str = "") -> str:
+    if not value:
+        return fallback
+    value = re.sub(r"\s+", " ", str(value)).strip()
+    return value[:1024]
+
+
+def filename_caption(path: str) -> str:
     name = Path(path).stem
     name = re.sub(r"_ios$", "", name, flags=re.I)
     name = re.sub(r"^[0-9a-f]{32}_", "", name, flags=re.I)
@@ -109,29 +123,62 @@ def is_too_large(path: str) -> bool:
 
 
 def newest_media(directory: str) -> list[str]:
-    return sorted([p for p in glob.glob(os.path.join(directory, "**", "*"), recursive=True) if os.path.isfile(p) and Path(p).suffix.lower() in MEDIA_EXTENSIONS], key=os.path.getmtime)
+    return sorted(
+        [p for p in glob.glob(os.path.join(directory, "**", "*"), recursive=True) if os.path.isfile(p) and Path(p).suffix.lower() in MEDIA_EXTENSIONS],
+        key=os.path.getmtime,
+    )
 
 
 def run_process(command: list[str], timeout: int = DOWNLOAD_TIMEOUT) -> subprocess.CompletedProcess:
     return subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
 
 
-def download_with_yt_dlp(url: str, headers: dict[str, str], out_dir: str) -> list[str]:
+def download_with_yt_dlp(url: str, headers: dict[str, str], out_dir: str) -> tuple[list[str], str]:
     output = os.path.join(out_dir, f"{uuid.uuid4().hex}_%(title).120s.%(ext)s")
-    opts = {"outtmpl": output, "format": "bestvideo*+bestaudio/best", "merge_output_format": "mp4", "noplaylist": False, "quiet": True, "no_warnings": True, "retries": 3, "fragment_retries": 5, "concurrent_fragment_downloads": 4, "http_headers": headers, "socket_timeout": 30}
+    opts = {
+        "outtmpl": output, "format": "bestvideo*+bestaudio/best", "merge_output_format": "mp4",
+        "noplaylist": False, "quiet": True, "no_warnings": True, "retries": 3,
+        "fragment_retries": 5, "concurrent_fragment_downloads": 4,
+        "http_headers": headers, "socket_timeout": 30,
+    }
     if COOKIES_PATH:
         opts["cookiefile"] = COOKIES_PATH
     with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.extract_info(url, download=True)
-    return newest_media(out_dir)
+        info = ydl.extract_info(url, download=True)
+    files = newest_media(out_dir)
+    caption = clean_caption(
+        info.get("description") or info.get("title") if isinstance(info, dict) else None,
+        filename_caption(files[0]) if files else "Video",
+    )
+    return files, caption
 
 
-def download_with_gallery_dl(url: str, out_dir: str) -> list[str]:
-    """Fallback for Instagram/Facebook photo posts and carousels."""
+def extract_caption_from_json(directory: str) -> str:
+    candidates = sorted(glob.glob(os.path.join(directory, "**", "*.json"), recursive=True), key=os.path.getmtime, reverse=True)
+    for json_path in candidates:
+        try:
+            with open(json_path, "r", encoding="utf-8", errors="ignore") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                for key in ("description", "content", "caption", "title"):
+                    if data.get(key):
+                        return clean_caption(data[key])
+                for nested_key in ("post", "media", "metadata"):
+                    nested = data.get(nested_key)
+                    if isinstance(nested, dict):
+                        for key in ("description", "content", "caption", "title"):
+                            if nested.get(key):
+                                return clean_caption(nested[key])
+        except Exception:
+            continue
+    return ""
+
+
+def download_with_gallery_dl(url: str, out_dir: str) -> tuple[list[str], str]:
     binary = shutil.which("gallery-dl") or shutil.which("gallery-dl.exe")
     if not binary:
         raise RuntimeError("gallery-dl is not installed")
-    command = [binary, "--directory", out_dir, "--no-mtime"]
+    command = [binary, "--directory", out_dir, "--no-mtime", "--write-info-json"]
     if COOKIES_PATH:
         command += ["--cookies", COOKIES_PATH]
     command += [url]
@@ -141,8 +188,7 @@ def download_with_gallery_dl(url: str, out_dir: str) -> list[str]:
         raise RuntimeError(result.stderr[-3000:] or result.stdout[-3000:] or "gallery-dl failed")
     if not files:
         raise RuntimeError("gallery-dl completed but produced no media")
-    logger.info("gallery-dl recovered %d media file(s)", len(files))
-    return files
+    return files, (extract_caption_from_json(out_dir) or filename_caption(files[0]))
 
 
 def extract_cookie_header(cookie_path: str, target_url: str) -> str:
@@ -164,7 +210,7 @@ def extract_cookie_header(cookie_path: str, target_url: str) -> str:
     return "; ".join(pairs)
 
 
-def download_with_n_m3u8dl(url: str, headers: dict[str, str], out_dir: str) -> list[str]:
+def download_with_n_m3u8dl(url: str, headers: dict[str, str], out_dir: str) -> tuple[list[str], str]:
     binary = shutil.which("N_m3u8DL-RE") or shutil.which("N_m3u8DL-RE.exe")
     if not binary:
         raise RuntimeError("N_m3u8DL-RE is not installed")
@@ -178,10 +224,11 @@ def download_with_n_m3u8dl(url: str, headers: dict[str, str], out_dir: str) -> l
     result = run_process(command)
     if result.returncode != 0:
         raise RuntimeError(result.stderr[-2500:] or result.stdout[-2500:] or "N_m3u8DL-RE failed")
-    return newest_media(out_dir)
+    files = newest_media(out_dir)
+    return files, (filename_caption(files[0]) if files else "Video")
 
 
-def download_with_streamlink(url: str, headers: dict[str, str], out_dir: str) -> list[str]:
+def download_with_streamlink(url: str, headers: dict[str, str], out_dir: str) -> tuple[list[str], str]:
     if not streamlink:
         raise RuntimeError("Streamlink is not installed")
     raw_path = os.path.join(out_dir, "stream.ts")
@@ -198,10 +245,10 @@ def download_with_streamlink(url: str, headers: dict[str, str], out_dir: str) ->
     result = run_process([shutil.which("ffmpeg") or "ffmpeg", "-y", "-i", raw_path, "-c", "copy", mp4_path])
     if result.returncode != 0 or not os.path.exists(mp4_path):
         raise RuntimeError(result.stderr[-2500:] or "FFmpeg remux failed")
-    return [mp4_path]
+    return [mp4_path], "Video"
 
 
-async def download_direct(url: str, headers: dict[str, str], out_dir: str) -> list[str]:
+async def download_direct(url: str, headers: dict[str, str], out_dir: str) -> tuple[list[str], str]:
     filename = filename_from_url(url)
     if not Path(filename).suffix:
         filename += ".mp4"
@@ -218,10 +265,10 @@ async def download_direct(url: str, headers: dict[str, str], out_dir: str) -> li
             with open(path, "wb") as fh:
                 async for chunk in response.aiter_bytes(1024 * 1024):
                     fh.write(chunk)
-    return [path]
+    return [path], filename_caption(path)
 
 
-async def process_url(url: str, headers: dict[str, str], work_dir: str) -> list[str]:
+async def process_url(url: str, headers: dict[str, str], work_dir: str) -> tuple[list[str], str]:
     manifest = bool(MANIFEST_RE.search(url.lower()))
     suffix = Path(urlparse(url).path).suffix.lower()
     host = (urlparse(url).hostname or "").lower()
@@ -229,9 +276,9 @@ async def process_url(url: str, headers: dict[str, str], work_dir: str) -> list[
 
     if suffix in DIRECT_EXTENSIONS:
         try:
-            files = await download_direct(url, headers, work_dir)
+            files, caption = await download_direct(url, headers, work_dir)
             if files and not is_too_large(files[0]):
-                return files
+                return files, caption
         except Exception as exc:
             logger.info("Direct download failed: %s", exc)
 
@@ -247,17 +294,15 @@ async def process_url(url: str, headers: dict[str, str], work_dir: str) -> list[
         return download_with_streamlink(url, headers, work_dir)
 
     try:
-        files = download_with_yt_dlp(url, headers, work_dir)
+        files, caption = download_with_yt_dlp(url, headers, work_dir)
         if files:
-            return files
+            return files, caption
     except Exception as exc:
         logger.warning("yt-dlp failed: %s", exc)
 
     if is_social:
         try:
-            files = download_with_gallery_dl(url, work_dir)
-            if files:
-                return files
+            return download_with_gallery_dl(url, work_dir)
         except Exception as exc:
             logger.warning("gallery-dl image fallback failed: %s", exc)
 
@@ -288,8 +333,7 @@ def ensure_telegram_compatible(path: str) -> str:
     return output
 
 
-async def send_media(update: Update, path: str) -> None:
-    caption = caption_from_path(path)
+async def send_single(update: Update, path: str, caption: str) -> None:
     if is_video(path):
         path = ensure_telegram_compatible(path)
         if is_too_large(path):
@@ -315,8 +359,32 @@ async def send_media(update: Update, path: str) -> None:
         await update.message.reply_document(document=media, caption=caption)
 
 
+async def send_image_album(update: Update, files: list[str], caption: str) -> None:
+    files = files[:20]
+    for start in range(0, len(files), 10):
+        chunk = files[start:start + 10]
+        handles = []
+        media_group = []
+        try:
+            for index, path in enumerate(chunk):
+                fh = open(path, "rb")
+                handles.append(fh)
+                media_group.append(InputMediaPhoto(media=fh, caption=caption if start == 0 and index == 0 else None))
+            await update.message.reply_media_group(media=media_group)
+        finally:
+            for fh in handles:
+                fh.close()
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("👋 **Hey! Welcome!**\n\n📥 **Instagram & Facebook Downloader**\n\n🔗 Bas Reel, Video, Story ya Post ka link yahan paste karo.\n⚡️ Main media process karke directly yahin send kar dunga.\n\n**No extra steps. Just paste the link! 🚀**", parse_mode="Markdown")
+    await update.message.reply_text(
+        "👋 **Hey! Welcome!**\n\n"
+        "📥 **Instagram & Facebook Downloader**\n\n"
+        "🔗 Bas Reel, Video, Story ya Post ka link yahan paste karo.\n"
+        "⚡️ Main media process karke directly yahin send kar dunga.\n\n"
+        "**No extra steps. Just paste the link! 🚀**",
+        parse_mode="Markdown",
+    )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -336,26 +404,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     status = await update.message.reply_text("⏳ **Processing your media...**", parse_mode="Markdown")
     with tempfile.TemporaryDirectory(prefix="tgdl_") as work_dir:
         try:
-            files = [f for f in await process_url(url, headers, work_dir) if os.path.isfile(f)]
+            files, caption = await process_url(url, headers, work_dir)
+            files = [f for f in files if os.path.isfile(f) and not is_too_large(f)]
             if not files:
                 raise RuntimeError("No media file was produced")
-            files = [f for f in files if not is_too_large(f)]
-            if not files:
-                await status.edit_text(f"❌ **File is too large for Telegram's current bot upload limit ({MAX_FILE_SIZE_MB} MB).**")
-                return
+            caption = clean_caption(caption, filename_caption(files[0]))
             await status.edit_text("📤 **Almost there!**\n\nYour media is ready — sending it now... ✨", parse_mode="Markdown")
-            for path in files[:10]:
-                await send_media(update, path)
+
+            image_files = [f for f in files if is_image(f)]
+            if len(image_files) > 1 and len(image_files) == len(files):
+                await send_image_album(update, image_files, caption)
+            else:
+                for path in files[:20]:
+                    await send_single(update, path, caption)
             await status.delete()
-        except Exception:
+        except Exception as exc:
             logger.exception("Download failed for %s", url)
-            await status.edit_text("❌ **Couldn't download this media**\n\nThe link may be private, expired, login-required, protected, or unsupported.\n\n🔄 **Please check the link and try again.**")
+            await status.edit_text(
+                "❌ **Couldn't download this media**\n\n"
+                "The link may be private, expired, login-required, protected, or unsupported.\n\n"
+                f"Technical reason: `{str(exc)[:500]}`"
+            )
 
 
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is not set")
-    logger.info("Starting bot | cookies=%s | gallery-dl=%s | ffmpeg=%s | streamlink=%s", "YES" if COOKIES_PATH else "NO", "YES" if shutil.which("gallery-dl") else "NO", "YES" if shutil.which("ffmpeg") else "NO", "YES" if streamlink else "NO")
+    logger.info("Starting bot | cookies=%s | gallery-dl=%s | N_m3u8DL-RE=%s | ffmpeg=%s | streamlink=%s", "YES" if COOKIES_PATH else "NO", "YES" if shutil.which("gallery-dl") else "NO", "YES" if shutil.which("N_m3u8DL-RE") else "NO", "YES" if shutil.which("ffmpeg") else "NO", "YES" if streamlink else "NO")
     app = Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(120).write_timeout(120).pool_timeout(30).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
