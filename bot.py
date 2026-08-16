@@ -1,7 +1,5 @@
 """Universal Telegram media downloader."""
-
 import glob
-import json
 import logging
 import mimetypes
 import os
@@ -26,16 +24,14 @@ except ImportError:
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 COOKIES_FILE = os.environ.get("COOKIES_FILE", "").strip()
 MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "5"))
 DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "1800"))
 DEFAULT_USER_AGENT = os.environ.get("DEFAULT_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36")
-
-URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
-MANIFEST_RE = re.compile(r"\.(m3u8|m3u|mpd)(?:$|[?#])", re.IGNORECASE)
+URL_RE = re.compile(r"^https?://\S+$", re.I)
+MANIFEST_RE = re.compile(r"\.(m3u8|m3u|mpd)(?:$|[?#])", re.I)
 DIRECT_EXTENSIONS = {".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".ts", ".m4a", ".mp3", ".aac", ".flac"}
 VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".ts"}
 _last_request: dict[int, float] = {}
@@ -48,11 +44,10 @@ def prepare_cookies_file() -> str | None:
         return COOKIES_FILE
     value = COOKIES_FILE
     if not ("# Netscape HTTP Cookie File" in value or "# HTTP Cookie File" in value or ("instagram.com" in value and "\t" in value)):
-        logger.warning("COOKIES_FILE is set but no valid cookies.txt content was detected")
         return None
     path = os.path.join(tempfile.gettempdir(), "bot_cookies.txt")
     try:
-        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        with open(path, "w", encoding="utf-8") as fh:
             fh.write(value)
             if not value.endswith("\n"):
                 fh.write("\n")
@@ -66,21 +61,17 @@ COOKIES_PATH = prepare_cookies_file()
 
 
 def parse_request(text: str) -> tuple[str | None, dict[str, str]]:
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not lines:
-        return None, {}
-    url = lines[0]
-    if not URL_RE.match(url):
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+    if not lines or not URL_RE.match(lines[0]):
         return None, {}
     headers = {"User-Agent": DEFAULT_USER_AGENT}
     for line in lines[1:]:
         if ":" not in line:
             continue
         key, value = line.split(":", 1)
-        key, value = key.strip(), value.strip()
-        if key and value and key.lower() not in {"cookie", "authorization"}:
-            headers[key] = value
-    return url, headers
+        if key.strip() and value.strip() and key.strip().lower() not in {"cookie", "authorization"}:
+            headers[key.strip()] = value.strip()
+    return lines[0], headers
 
 
 def safe_filename(name: str, fallback: str = "video") -> str:
@@ -89,9 +80,16 @@ def safe_filename(name: str, fallback: str = "video") -> str:
 
 
 def filename_from_url(url: str) -> str:
-    path_name = Path(urlparse(url).path).name
-    stem = Path(path_name).stem if path_name else "video"
-    return safe_filename(stem or "video")
+    name = Path(urlparse(url).path).name
+    return safe_filename(Path(name).stem if name else "video")
+
+
+def caption_from_path(path: str) -> str:
+    name = Path(path).stem
+    name = re.sub(r"_ios$", "", name, flags=re.I)
+    name = re.sub(r"^[0-9a-f]{32}_", "", name, flags=re.I)
+    name = re.sub(r"\s+", " ", name).strip(" _.-")
+    return name[:1024] or "Video"
 
 
 def is_too_large(path: str) -> bool:
@@ -99,11 +97,7 @@ def is_too_large(path: str) -> bool:
 
 
 def newest_media(directory: str) -> list[str]:
-    files = []
-    for path in glob.glob(os.path.join(directory, "**", "*"), recursive=True):
-        if os.path.isfile(path) and Path(path).suffix.lower() in VIDEO_EXTENSIONS:
-            files.append(path)
-    return sorted(files, key=os.path.getmtime)
+    return sorted([p for p in glob.glob(os.path.join(directory, "**", "*"), recursive=True) if os.path.isfile(p) and Path(p).suffix.lower() in VIDEO_EXTENSIONS], key=os.path.getmtime)
 
 
 def run_process(command: list[str], timeout: int = DOWNLOAD_TIMEOUT) -> subprocess.CompletedProcess:
@@ -124,19 +118,18 @@ def extract_cookie_header(cookie_path: str, target_url: str) -> str:
     host = (urlparse(target_url).hostname or "").lower()
     pairs = []
     try:
-        with open(cookie_path, "r", encoding="utf-8", errors="ignore") as fh:
+        with open(cookie_path, encoding="utf-8", errors="ignore") as fh:
             for line in fh:
                 if not line or line.startswith("#"):
                     continue
                 parts = line.rstrip("\n").split("\t")
-                if len(parts) < 7:
-                    continue
-                domain, _, _, _, _, name, value = parts[:7]
-                domain = domain.lstrip(".").lower()
-                if host == domain or host.endswith("." + domain):
-                    pairs.append(f"{name}={value}")
+                if len(parts) >= 7:
+                    domain, _, _, _, _, name, value = parts[:7]
+                    domain = domain.lstrip(".").lower()
+                    if host == domain or host.endswith("." + domain):
+                        pairs.append(f"{name}={value}")
     except OSError:
-        return ""
+        pass
     return "; ".join(pairs)
 
 
@@ -188,10 +181,9 @@ async def download_direct(url: str, headers: dict[str, str], out_dir: str) -> li
             content_type = response.headers.get("content-type", "").lower()
             if "text/html" in content_type and not Path(urlparse(str(response.url)).path).suffix:
                 raise RuntimeError("URL returned a webpage instead of a media file")
-            if not Path(path).suffix or Path(path).suffix == ".mp4":
-                ext = mimetypes.guess_extension(content_type.split(";", 1)[0].strip())
-                if ext in DIRECT_EXTENSIONS:
-                    path = os.path.join(out_dir, safe_filename(Path(filename).stem + ext))
+            ext = mimetypes.guess_extension(content_type.split(";", 1)[0].strip())
+            if ext in DIRECT_EXTENSIONS:
+                path = os.path.join(out_dir, safe_filename(Path(filename).stem + ext))
             with open(path, "wb") as fh:
                 async for chunk in response.aiter_bytes(1024 * 1024):
                     fh.write(chunk)
@@ -234,54 +226,18 @@ def is_telegram_video(path: str) -> bool:
 
 
 def ensure_telegram_compatible(path: str) -> str:
-    """Always create a conservative MP4 profile that Telegram/iOS can decode reliably."""
     if not is_telegram_video(path):
         return path
-
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
-        logger.warning("ffmpeg unavailable; cannot create iOS-compatible MP4")
         return path
-
     output = os.path.join(os.path.dirname(path), f"{Path(path).stem}_ios.mp4")
-
-    # Do not rely on the source codec/profile being "compatible". Some files report
-    # H.264/AAC but still contain levels, HDR, odd dimensions, or metadata that cause
-    # Telegram's iOS player to show audio without video. Always normalize the output.
-    # Keep <=1080p, force 8-bit 4:2:0 H.264 + AAC-LC and put the MP4 index first.
-    vf = (
-        "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:"
-        "force_divisible_by=2,"
-        "format=yuv420p"
-    )
-
-    command = [
-        ffmpeg, "-y", "-i", path,
-        "-map", "0:v:0", "-map", "0:a:0?",
-        "-vf", vf,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
-        "-profile:v", "main",
-        "-level:v", "4.0",
-        "-pix_fmt", "yuv420p",
-        "-tag:v", "avc1",
-        "-c:a", "aac",
-        "-profile:a", "aac_low",
-        "-b:a", "128k",
-        "-ar", "48000",
-        "-ac", "2",
-        "-map_metadata", "-1",
-        "-movflags", "+faststart",
-        output,
-    ]
-
+    vf = "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p"
+    command = [ffmpeg, "-y", "-i", path, "-map", "0:v:0", "-map", "0:a:0?", "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-profile:v", "main", "-level:v", "4.0", "-pix_fmt", "yuv420p", "-tag:v", "avc1", "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "128k", "-ar", "48000", "-ac", "2", "-map_metadata", "-1", "-movflags", "+faststart", output]
     result = run_process(command, timeout=DOWNLOAD_TIMEOUT)
     if result.returncode != 0 or not os.path.isfile(output) or os.path.getsize(output) == 0:
         logger.error("iOS MP4 conversion failed: %s", result.stderr[-3000:])
         return path
-
-    logger.info("Created iOS-compatible MP4: %s (%d bytes)", output, os.path.getsize(output))
     try:
         os.remove(path)
     except OSError:
@@ -289,7 +245,8 @@ def ensure_telegram_compatible(path: str) -> str:
     return output
 
 
-async def send_media(update: Update, path: str, caption: str) -> None:
+async def send_media(update: Update, path: str) -> None:
+    caption = caption_from_path(path)
     if is_telegram_video(path):
         path = ensure_telegram_compatible(path)
         if is_too_large(path):
@@ -308,7 +265,14 @@ async def send_media(update: Update, path: str, caption: str) -> None:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("👋 **Hey! Welcome!**\n\n📥 **Universal Media Downloader**\n\n🔗 Bas video, Reel, Story, stream ya direct media link yahan paste karo.\n⚡ Main usse process karke media directly yahin bhej dunga.\n\n**No extra steps. Just paste the link! 🚀**", parse_mode="Markdown")
+    await update.message.reply_text(
+        "👋 **Hey! Welcome!**\n\n"
+        "📥 **Instagram & Facebook Downloader**\n\n"
+        "🔗 Bas Reel, Video, Story ya Post ka link yahan paste karo.\n"
+        "⚡️ Main media process karke directly yahin send kar dunga.\n\n"
+        "**No extra steps. Just paste the link! 🚀**",
+        parse_mode="Markdown",
+    )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -328,8 +292,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     status = await update.message.reply_text("⏳ **Processing your media...**", parse_mode="Markdown")
     with tempfile.TemporaryDirectory(prefix="tgdl_") as work_dir:
         try:
-            files = await process_url(url, headers, work_dir)
-            files = [f for f in files if os.path.isfile(f)]
+            files = [f for f in await process_url(url, headers, work_dir) if os.path.isfile(f)]
             if not files:
                 raise RuntimeError("No media file was produced")
             files = [f for f in files if not is_too_large(f)]
@@ -337,9 +300,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await status.edit_text(f"❌ **File is too large for Telegram's current bot upload limit ({MAX_FILE_SIZE_MB} MB).**")
                 return
             await status.edit_text("📤 **Almost there!**\n\nYour media is ready — sending it now... ✨", parse_mode="Markdown")
-            for index, path in enumerate(files[:10]):
-                caption = "" if index else "Downloaded by Universal Media Downloader 🚀"
-                await send_media(update, path, caption)
+            for path in files[:10]:
+                await send_media(update, path)
             await status.delete()
         except Exception:
             logger.exception("Download failed for %s", url)
@@ -349,7 +311,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is not set")
-    logger.info("Universal downloader starting | cookies=%s | N_m3u8DL-RE=%s | ffmpeg=%s | streamlink=%s", "YES" if COOKIES_PATH else "NO", "YES" if shutil.which("N_m3u8DL-RE") else "NO", "YES" if shutil.which("ffmpeg") else "NO", "YES" if streamlink else "NO")
     app = Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(120).write_timeout(120).pool_timeout(30).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
