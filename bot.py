@@ -233,54 +233,55 @@ def is_telegram_video(path: str) -> bool:
     return Path(path).suffix.lower() == ".mp4"
 
 
-def probe_video(path: str) -> tuple[str | None, str | None, str | None, str | None, int | None]:
-    ffprobe = shutil.which("ffprobe")
-    if not ffprobe:
-        return None, None, None, None, None
-    result = run_process([ffprobe, "-v", "error", "-show_entries", "stream=codec_type,codec_name,pix_fmt,profile,width,height", "-of", "json", path], timeout=60)
-    if result.returncode != 0:
-        return None, None, None, None, None
-    try:
-        streams = json.loads(result.stdout).get("streams", [])
-    except (json.JSONDecodeError, TypeError):
-        return None, None, None, None, None
-    video = next((s for s in streams if s.get("codec_type") == "video"), {})
-    audio = next((s for s in streams if s.get("codec_type") == "audio"), {})
-    return video.get("codec_name"), audio.get("codec_name"), video.get("pix_fmt"), video.get("profile"), video.get("width")
-
-
 def ensure_telegram_compatible(path: str) -> str:
+    """Always create a conservative MP4 profile that Telegram/iOS can decode reliably."""
     if not is_telegram_video(path):
         return path
-    ffmpeg = shutil.which("ffmpeg")
-    ffprobe = shutil.which("ffprobe")
-    if not ffmpeg or not ffprobe:
-        logger.warning("ffmpeg/ffprobe unavailable; skipping Telegram compatibility conversion")
-        return path
 
-    video_codec, audio_codec, pix_fmt, profile, width = probe_video(path)
-    # iOS Telegram is stricter than desktop/Android. Force a conservative H.264/AAC MP4:
-    # Baseline/Main profile, 8-bit 4:2:0, even dimensions, no HDR/10-bit, fast-start MP4.
-    compatible = video_codec == "h264" and audio_codec == "aac" and pix_fmt == "yuv420p" and profile in {"Baseline", "Main", "Constrained Baseline"}
-    if compatible:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        logger.warning("ffmpeg unavailable; cannot create iOS-compatible MP4")
         return path
 
     output = os.path.join(os.path.dirname(path), f"{Path(path).stem}_ios.mp4")
-    # Scale only when necessary to even dimensions. Keep source resolution otherwise.
-    vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p"
-    result = run_process([
+
+    # Do not rely on the source codec/profile being "compatible". Some files report
+    # H.264/AAC but still contain levels, HDR, odd dimensions, or metadata that cause
+    # Telegram's iOS player to show audio without video. Always normalize the output.
+    # Keep <=1080p, force 8-bit 4:2:0 H.264 + AAC-LC and put the MP4 index first.
+    vf = (
+        "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:"
+        "force_divisible_by=2,"
+        "format=yuv420p"
+    )
+
+    command = [
         ffmpeg, "-y", "-i", path,
-        "-map", "0:v:0", "-map", "0:a?",
-        "-c:v", "libx264", "-profile:v", "main", "-level:v", "4.0",
-        "-preset", "veryfast", "-crf", "22", "-vf", vf,
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-vf", vf,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-profile:v", "main",
+        "-level:v", "4.0",
         "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "128k", "-ar", "48000",
+        "-tag:v", "avc1",
+        "-c:a", "aac",
+        "-profile:a", "aac_low",
+        "-b:a", "128k",
+        "-ar", "48000",
+        "-ac", "2",
+        "-map_metadata", "-1",
         "-movflags", "+faststart",
         output,
-    ], timeout=DOWNLOAD_TIMEOUT)
+    ]
+
+    result = run_process(command, timeout=DOWNLOAD_TIMEOUT)
     if result.returncode != 0 or not os.path.isfile(output) or os.path.getsize(output) == 0:
-        logger.error("iOS conversion failed: %s", result.stderr[-2500:])
+        logger.error("iOS MP4 conversion failed: %s", result.stderr[-3000:])
         return path
+
+    logger.info("Created iOS-compatible MP4: %s (%d bytes)", output, os.path.getsize(output))
     try:
         os.remove(path)
     except OSError:
@@ -321,7 +322,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     url, headers = parse_request(update.message.text)
     if not url:
-        await update.message.reply_text("🔗 **That doesn't look like a valid URL.**\n\nPlease send an Instagram, Facebook, video, stream, M3U8/HLS, or direct media link.", parse_mode="Markdown")
+        await update.message.reply_text("🔗 **That doesn't look like a valid URL.**\n\nPlease send a video, stream, M3U8/HLS, or direct media link.", parse_mode="Markdown")
         return
     _last_request[user_id] = now
     status = await update.message.reply_text("⏳ **Processing your media...**", parse_mode="Markdown")
@@ -333,11 +334,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 raise RuntimeError("No media file was produced")
             files = [f for f in files if not is_too_large(f)]
             if not files:
-                await status.edit_text(f"❌ **File is too large for Telegram's current bot upload limit ({MAX_FILE_SIZE_MB} MB).")
+                await status.edit_text(f"❌ **File is too large for Telegram's current bot upload limit ({MAX_FILE_SIZE_MB} MB).**")
                 return
             await status.edit_text("📤 **Almost there!**\n\nYour media is ready — sending it now... ✨", parse_mode="Markdown")
             for index, path in enumerate(files[:10]):
-                await send_media(update, path, "" if index else "Downloaded by Universal Media Downloader 🚀")
+                caption = "" if index else "Downloaded by Universal Media Downloader 🚀"
+                await send_media(update, path, caption)
             await status.delete()
         except Exception:
             logger.exception("Download failed for %s", url)
@@ -347,11 +349,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is not set")
-    logger.info("Universal downloader starting | cookies=%s | N_m3u8DL-RE=%s | ffmpeg=%s | ffprobe=%s | streamlink=%s", "YES" if COOKIES_PATH else "NO", "YES" if shutil.which("N_m3u8DL-RE") else "NO", "YES" if shutil.which("ffmpeg") else "NO", "YES" if shutil.which("ffprobe") else "NO", "YES" if streamlink else "NO")
+    logger.info("Universal downloader starting | cookies=%s | N_m3u8DL-RE=%s | ffmpeg=%s | streamlink=%s", "YES" if COOKIES_PATH else "NO", "YES" if shutil.which("N_m3u8DL-RE") else "NO", "YES" if shutil.which("ffmpeg") else "NO", "YES" if streamlink else "NO")
     app = Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(120).write_timeout(120).pool_timeout(30).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
