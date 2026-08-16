@@ -30,16 +30,57 @@ logger = logging.getLogger(__name__)
 # ---- config (env vars, with sane defaults) ---------------------------------
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")  # required
-COOKIES_FILE = os.environ.get("COOKIES_FILE", "cookies.txt")  # optional, see README
-MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))  # Telegram bot API cap
-COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "15"))  # per-user, avoids IG/FB bans
+COOKIES_FILE = os.environ.get("COOKIES_FILE", "cookies.txt")
+MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))
+COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "15"))
+
+
+def prepare_cookies_file() -> str | None:
+    """Resolve COOKIES_FILE as either a file path or inline Netscape cookies content.
+
+    This allows Railway Variables to contain the cookies.txt contents directly,
+    without committing the sensitive cookies file to GitHub.
+    """
+    value = COOKIES_FILE.strip()
+    if not value:
+        return None
+
+    # Normal/local deployment: variable contains a path such as cookies.txt.
+    if os.path.isfile(value):
+        return value
+
+    # Railway: variable contains the actual cookies.txt contents.
+    # Netscape cookie files normally contain this header and tab-separated rows.
+    looks_like_cookie_content = (
+        "# Netscape HTTP Cookie File" in value
+        or "# HTTP Cookie File" in value
+        or "instagram.com" in value and "\t" in value
+    )
+    if looks_like_cookie_content:
+        cookie_path = os.path.join(tempfile.gettempdir(), "instagram_cookies.txt")
+        try:
+            with open(cookie_path, "w", encoding="utf-8") as fh:
+                fh.write(value)
+                if not value.endswith("\n"):
+                    fh.write("\n")
+            os.chmod(cookie_path, 0o600)
+            logger.info("Instagram cookies loaded from COOKIES_FILE environment variable")
+            return cookie_path
+        except Exception:
+            logger.exception("Could not create cookies file from COOKIES_FILE variable")
+            return None
+
+    logger.warning("COOKIES_FILE is set but no readable cookies file/content was detected")
+    return None
+
+
+COOKIES_PATH = prepare_cookies_file()
 
 URL_PATTERN = re.compile(
     r"(https?://)?(www\.)?(instagram\.com|facebook\.com|fb\.watch)/\S+",
     re.IGNORECASE,
 )
 
-# very small in-memory cooldown tracker: {user_id: last_request_unix_time}
 _last_request: dict[int, float] = {}
 
 
@@ -80,8 +121,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "quiet": True,
             "no_warnings": True,
         }
-        if os.path.exists(COOKIES_FILE):
-            ydl_opts["cookiefile"] = COOKIES_FILE
+        if COOKIES_PATH:
+            ydl_opts["cookiefile"] = COOKIES_PATH
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -101,8 +142,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         video_exts = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
         video_files = sorted(
             (
-                f
-                for f in glob.glob(os.path.join(tmp_dir, "*"))
+                f for f in glob.glob(os.path.join(tmp_dir, "*"))
                 if os.path.splitext(f)[1].lower() in video_exts
             ),
             key=os.path.getmtime,
@@ -118,8 +158,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "-D", image_dir,
             url,
         ]
-        if os.path.exists(COOKIES_FILE):
-            gdl_cmd[1:1] = ["-C", COOKIES_FILE]
+        if COOKIES_PATH:
+            gdl_cmd[1:1] = ["-C", COOKIES_PATH]
         try:
             subprocess.run(gdl_cmd, capture_output=True, timeout=60, check=False)
         except Exception:
@@ -128,8 +168,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         image_exts = {".jpg", ".jpeg", ".png", ".webp"}
         image_files = sorted(
             (
-                f
-                for f in glob.glob(os.path.join(image_dir, "**", "*"), recursive=True)
+                f for f in glob.glob(os.path.join(image_dir, "**", "*"), recursive=True)
                 if os.path.splitext(f)[1].lower() in image_exts
             ),
             key=os.path.getmtime,
