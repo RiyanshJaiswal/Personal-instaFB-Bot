@@ -24,6 +24,7 @@ except ImportError:
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 COOKIES_FILE = os.environ.get("COOKIES_FILE", "").strip()
 MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "120"))
@@ -57,7 +58,7 @@ def prepare_cookies_file() -> str | None:
         os.chmod(path, 0o600)
         return path
     except Exception:
-        logger.exception("Could not create temporary cookies file")
+        logger.exception("Could not create temporary cookie file")
         return None
 
 COOKIES_PATH = prepare_cookies_file()
@@ -123,6 +124,25 @@ def download_with_yt_dlp(url: str, headers: dict[str, str], out_dir: str) -> lis
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.extract_info(url, download=True)
     return newest_media(out_dir)
+
+
+def download_with_gallery_dl(url: str, out_dir: str) -> list[str]:
+    """Fallback for Instagram/Facebook photo posts and carousels."""
+    binary = shutil.which("gallery-dl") or shutil.which("gallery-dl.exe")
+    if not binary:
+        raise RuntimeError("gallery-dl is not installed")
+    command = [binary, "--directory", out_dir, "--no-mtime"]
+    if COOKIES_PATH:
+        command += ["--cookies", COOKIES_PATH]
+    command += [url]
+    result = run_process(command)
+    files = newest_media(out_dir)
+    if result.returncode != 0 and not files:
+        raise RuntimeError(result.stderr[-3000:] or result.stdout[-3000:] or "gallery-dl failed")
+    if not files:
+        raise RuntimeError("gallery-dl completed but produced no media")
+    logger.info("gallery-dl recovered %d media file(s)", len(files))
+    return files
 
 
 def extract_cookie_header(cookie_path: str, target_url: str) -> str:
@@ -204,6 +224,9 @@ async def download_direct(url: str, headers: dict[str, str], out_dir: str) -> li
 async def process_url(url: str, headers: dict[str, str], work_dir: str) -> list[str]:
     manifest = bool(MANIFEST_RE.search(url.lower()))
     suffix = Path(urlparse(url).path).suffix.lower()
+    host = (urlparse(url).hostname or "").lower()
+    is_social = host.endswith("instagram.com") or host.endswith("facebook.com") or host.endswith("fb.watch")
+
     if suffix in DIRECT_EXTENSIONS:
         try:
             files = await download_direct(url, headers, work_dir)
@@ -211,6 +234,7 @@ async def process_url(url: str, headers: dict[str, str], work_dir: str) -> list[
                 return files
         except Exception as exc:
             logger.info("Direct download failed: %s", exc)
+
     if manifest:
         try:
             return download_with_n_m3u8dl(url, headers, work_dir)
@@ -221,10 +245,22 @@ async def process_url(url: str, headers: dict[str, str], work_dir: str) -> list[
         except Exception as exc:
             logger.warning("yt-dlp manifest fallback failed: %s", exc)
         return download_with_streamlink(url, headers, work_dir)
+
     try:
-        return download_with_yt_dlp(url, headers, work_dir)
+        files = download_with_yt_dlp(url, headers, work_dir)
+        if files:
+            return files
     except Exception as exc:
         logger.warning("yt-dlp failed: %s", exc)
+
+    if is_social:
+        try:
+            files = download_with_gallery_dl(url, work_dir)
+            if files:
+                return files
+        except Exception as exc:
+            logger.warning("gallery-dl image fallback failed: %s", exc)
+
     try:
         return download_with_streamlink(url, headers, work_dir)
     except Exception as exc:
@@ -319,6 +355,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is not set")
+    logger.info("Starting bot | cookies=%s | gallery-dl=%s | ffmpeg=%s | streamlink=%s", "YES" if COOKIES_PATH else "NO", "YES" if shutil.which("gallery-dl") else "NO", "YES" if shutil.which("ffmpeg") else "NO", "YES" if streamlink else "NO")
     app = Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(120).write_timeout(120).pool_timeout(30).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
