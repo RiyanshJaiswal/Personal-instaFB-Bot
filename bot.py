@@ -1,19 +1,6 @@
-"""Universal Telegram media downloader.
-
-Send a normal website URL, direct media URL, M3U8/HLS URL, or MPD URL.
-The bot tries the most appropriate downloader and sends the result back to Telegram.
-
-Optional Telegram message format for future desktop/IDM helper:
-    https://example.com/video.m3u8
-    Referer: https://example.com/page
-    User-Agent: Mozilla/5.0
-
-Cookies are supplied through COOKIES_FILE as either a path or Netscape cookies.txt
-content. Never commit cookies or bot tokens to GitHub.
-"""
+"""Universal Telegram media downloader."""
 
 import glob
-import json
 import logging
 import mimetypes
 import os
@@ -64,10 +51,8 @@ _last_request: dict[int, float] = {}
 
 
 def prepare_cookies_file() -> str | None:
-    """Resolve COOKIES_FILE as a real path or inline Netscape cookie content."""
     if not COOKIES_FILE:
         return None
-
     if os.path.isfile(COOKIES_FILE):
         return COOKIES_FILE
 
@@ -99,11 +84,9 @@ COOKIES_PATH = prepare_cookies_file()
 
 
 def parse_request(text: str) -> tuple[str | None, dict[str, str]]:
-    """Parse a URL and optional HTTP headers from a Telegram message."""
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
         return None, {}
-
     url = lines[0]
     if not URL_RE.match(url):
         return None, {}
@@ -122,7 +105,7 @@ def parse_request(text: str) -> tuple[str | None, dict[str, str]]:
 
 def safe_filename(name: str, fallback: str = "video") -> str:
     name = re.sub(r"[\\/:*?\"<>|\x00-\x1f]+", "_", name).strip(" .")
-    return (name[:160] or fallback)
+    return name[:160] or fallback
 
 
 def filename_from_url(url: str) -> str:
@@ -144,13 +127,7 @@ def newest_media(directory: str) -> list[str]:
 
 
 def run_process(command: list[str], timeout: int = DOWNLOAD_TIMEOUT) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
+    return subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
 
 
 def download_with_yt_dlp(url: str, headers: dict[str, str], out_dir: str) -> list[str]:
@@ -170,7 +147,6 @@ def download_with_yt_dlp(url: str, headers: dict[str, str], out_dir: str) -> lis
     }
     if COOKIES_PATH:
         opts["cookiefile"] = COOKIES_PATH
-
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.extract_info(url, download=True)
     return newest_media(out_dir)
@@ -183,20 +159,13 @@ def download_with_n_m3u8dl(url: str, headers: dict[str, str], out_dir: str) -> l
 
     name = safe_filename(filename_from_url(url))
     command = [
-        binary,
-        url,
-        "--save-dir", out_dir,
-        "--save-name", name,
-        "--del-after-done",
-        "--no-date-info",
-        "--no-log",
-        "--concurrent-download",
-        "--download-retry-count", "5",
+        binary, url, "--save-dir", out_dir, "--save-name", name,
+        "--del-after-done", "--no-date-info", "--no-log",
+        "--concurrent-download", "--download-retry-count", "5",
         "--http-request-timeout", "60",
         "--ffmpeg-binary-path", shutil.which("ffmpeg") or "/usr/bin/ffmpeg",
     ]
     if COOKIES_PATH:
-        # N_m3u8DL-RE accepts custom headers; cookies are passed as a Cookie header.
         cookie_header = extract_cookie_header(COOKIES_PATH, url)
         if cookie_header:
             command += ["-H", f"Cookie: {cookie_header}"]
@@ -210,7 +179,6 @@ def download_with_n_m3u8dl(url: str, headers: dict[str, str], out_dir: str) -> l
 
 
 def extract_cookie_header(cookie_path: str, target_url: str) -> str:
-    """Build a simple Cookie header from Netscape cookies matching the target host."""
     host = (urlparse(target_url).hostname or "").lower()
     pairs: list[str] = []
     try:
@@ -221,7 +189,7 @@ def extract_cookie_header(cookie_path: str, target_url: str) -> str:
                 parts = line.rstrip("\n").split("\t")
                 if len(parts) < 7:
                     continue
-                domain, include_subdomains, _, _, _, name, value = parts[:7]
+                domain, _, _, _, _, name, value = parts[:7]
                 domain = domain.lstrip(".").lower()
                 if host == domain or host.endswith("." + domain):
                     pairs.append(f"{name}={value}")
@@ -255,7 +223,6 @@ def download_with_streamlink(url: str, headers: dict[str, str], out_dir: str) ->
 
 
 async def download_direct(url: str, headers: dict[str, str], out_dir: str) -> list[str]:
-    parsed = urlparse(url)
     filename = filename_from_url(url)
     if not Path(filename).suffix:
         filename += ".mp4"
@@ -278,11 +245,9 @@ async def download_direct(url: str, headers: dict[str, str], out_dir: str) -> li
 
 
 async def process_url(url: str, headers: dict[str, str], work_dir: str) -> list[str]:
-    lower = url.lower()
-    manifest = bool(MANIFEST_RE.search(lower))
-
-    # Direct media files should not be routed through a site extractor.
+    manifest = bool(MANIFEST_RE.search(url.lower()))
     suffix = Path(urlparse(url).path).suffix.lower()
+
     if suffix in DIRECT_EXTENSIONS:
         try:
             files = await download_direct(url, headers, work_dir)
@@ -307,12 +272,35 @@ async def process_url(url: str, headers: dict[str, str], work_dir: str) -> list[
     except Exception as exc:
         logger.warning("yt-dlp failed: %s", exc)
 
-    # A site may expose a stream even when the page URL is not obviously a manifest.
     try:
         return download_with_streamlink(url, headers, work_dir)
     except Exception as exc:
         logger.warning("Streamlink failed: %s", exc)
         raise RuntimeError("All available download engines failed") from exc
+
+
+def is_telegram_video(path: str) -> bool:
+    """Return True for MP4 files that should be sent with Telegram's video API."""
+    return Path(path).suffix.lower() == ".mp4"
+
+
+async def send_media(update: Update, path: str, caption: str) -> None:
+    """Send MP4 as a playable Telegram video; fall back to document if needed."""
+    with open(path, "rb") as media:
+        if is_telegram_video(path):
+            try:
+                await update.message.reply_video(
+                    video=media,
+                    caption=caption,
+                    supports_streaming=True,
+                    width=None,
+                    height=None,
+                )
+                return
+            except Exception as exc:
+                logger.warning("Telegram video upload failed, falling back to document: %s", exc)
+                media.seek(0)
+        await update.message.reply_document(document=media, caption=caption)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -363,11 +351,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
                 return
 
-            await status.edit_text("📤 **Almost there!**\n\nYour media is ready — sending it now... ✨", parse_mode="Markdown")
+            await status.edit_text(
+                "📤 **Almost there!**\n\nYour media is ready — sending it now... ✨",
+                parse_mode="Markdown",
+            )
             for index, path in enumerate(files[:10]):
                 caption = "" if index else "Downloaded by Universal Media Downloader 🚀"
-                with open(path, "rb") as media:
-                    await update.message.reply_document(document=media, caption=caption)
+                await send_media(update, path, caption)
             await status.delete()
         except Exception:
             logger.exception("Download failed for %s", url)
@@ -382,11 +372,13 @@ def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is not set")
 
-    logger.info("Universal downloader starting | cookies=%s | N_m3u8DL-RE=%s | ffmpeg=%s | streamlink=%s",
-                "YES" if COOKIES_PATH else "NO",
-                "YES" if shutil.which("N_m3u8DL-RE") else "NO",
-                "YES" if shutil.which("ffmpeg") else "NO",
-                "YES" if streamlink else "NO")
+    logger.info(
+        "Universal downloader starting | cookies=%s | N_m3u8DL-RE=%s | ffmpeg=%s | streamlink=%s",
+        "YES" if COOKIES_PATH else "NO",
+        "YES" if shutil.which("N_m3u8DL-RE") else "NO",
+        "YES" if shutil.which("ffmpeg") else "NO",
+        "YES" if streamlink else "NO",
+    )
 
     app = (
         Application.builder()
