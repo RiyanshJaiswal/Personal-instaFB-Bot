@@ -1,4 +1,4 @@
-"""Universal Telegram media downloader."""
+"""Instagram/Facebook media downloader bot."""
 import glob
 import logging
 import mimetypes
@@ -26,14 +26,17 @@ logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 COOKIES_FILE = os.environ.get("COOKIES_FILE", "").strip()
-MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))
+MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "120"))
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "5"))
 DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "1800"))
 DEFAULT_USER_AGENT = os.environ.get("DEFAULT_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36")
 URL_RE = re.compile(r"^https?://\S+$", re.I)
 MANIFEST_RE = re.compile(r"\.(m3u8|m3u|mpd)(?:$|[?#])", re.I)
-DIRECT_EXTENSIONS = {".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".ts", ".m4a", ".mp3", ".aac", ".flac"}
 VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".ts"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+AUDIO_EXTENSIONS = {".m4a", ".mp3", ".aac", ".flac"}
+MEDIA_EXTENSIONS = VIDEO_EXTENSIONS | IMAGE_EXTENSIONS | AUDIO_EXTENSIONS
+DIRECT_EXTENSIONS = MEDIA_EXTENSIONS
 _last_request: dict[int, float] = {}
 
 
@@ -74,14 +77,22 @@ def parse_request(text: str) -> tuple[str | None, dict[str, str]]:
     return lines[0], headers
 
 
-def safe_filename(name: str, fallback: str = "video") -> str:
+def safe_filename(name: str, fallback: str = "media") -> str:
     name = re.sub(r"[\\/:*?\"<>|\x00-\x1f]+", "_", name).strip(" .")
     return name[:160] or fallback
 
 
 def filename_from_url(url: str) -> str:
     name = Path(urlparse(url).path).name
-    return safe_filename(Path(name).stem if name else "video")
+    return safe_filename(Path(name).stem if name else "media")
+
+
+def is_image(path: str) -> bool:
+    return Path(path).suffix.lower() in IMAGE_EXTENSIONS
+
+
+def is_video(path: str) -> bool:
+    return Path(path).suffix.lower() in VIDEO_EXTENSIONS
 
 
 def caption_from_path(path: str) -> str:
@@ -89,7 +100,7 @@ def caption_from_path(path: str) -> str:
     name = re.sub(r"_ios$", "", name, flags=re.I)
     name = re.sub(r"^[0-9a-f]{32}_", "", name, flags=re.I)
     name = re.sub(r"\s+", " ", name).strip(" _.-")
-    return name[:1024] or "Video"
+    return name[:1024] or ("Image" if is_image(path) else "Video")
 
 
 def is_too_large(path: str) -> bool:
@@ -97,7 +108,7 @@ def is_too_large(path: str) -> bool:
 
 
 def newest_media(directory: str) -> list[str]:
-    return sorted([p for p in glob.glob(os.path.join(directory, "**", "*"), recursive=True) if os.path.isfile(p) and Path(p).suffix.lower() in VIDEO_EXTENSIONS], key=os.path.getmtime)
+    return sorted([p for p in glob.glob(os.path.join(directory, "**", "*"), recursive=True) if os.path.isfile(p) and Path(p).suffix.lower() in MEDIA_EXTENSIONS], key=os.path.getmtime)
 
 
 def run_process(command: list[str], timeout: int = DOWNLOAD_TIMEOUT) -> subprocess.CompletedProcess:
@@ -180,7 +191,7 @@ async def download_direct(url: str, headers: dict[str, str], out_dir: str) -> li
             response.raise_for_status()
             content_type = response.headers.get("content-type", "").lower()
             if "text/html" in content_type and not Path(urlparse(str(response.url)).path).suffix:
-                raise RuntimeError("URL returned a webpage instead of a media file")
+                raise RuntimeError("URL returned a webpage instead of media")
             ext = mimetypes.guess_extension(content_type.split(";", 1)[0].strip())
             if ext in DIRECT_EXTENSIONS:
                 path = os.path.join(out_dir, safe_filename(Path(filename).stem + ext))
@@ -221,12 +232,8 @@ async def process_url(url: str, headers: dict[str, str], work_dir: str) -> list[
         raise RuntimeError("All available download engines failed") from exc
 
 
-def is_telegram_video(path: str) -> bool:
-    return Path(path).suffix.lower() == ".mp4"
-
-
 def ensure_telegram_compatible(path: str) -> str:
-    if not is_telegram_video(path):
+    if not is_video(path) or Path(path).suffix.lower() != ".mp4":
         return path
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -247,32 +254,33 @@ def ensure_telegram_compatible(path: str) -> str:
 
 async def send_media(update: Update, path: str) -> None:
     caption = caption_from_path(path)
-    if is_telegram_video(path):
+    if is_video(path):
         path = ensure_telegram_compatible(path)
         if is_too_large(path):
             raise RuntimeError(f"Converted video is too large for Telegram's current bot upload limit ({MAX_FILE_SIZE_MB} MB).")
         with open(path, "rb") as media:
             try:
                 await update.message.reply_video(video=media, caption=caption, supports_streaming=True)
-                return
             except Exception as exc:
                 logger.warning("Telegram video upload failed, falling back to document: %s", exc)
                 media.seek(0)
                 await update.message.reply_document(document=media, caption=caption)
-                return
+        return
+    if is_image(path):
+        with open(path, "rb") as media:
+            try:
+                await update.message.reply_photo(photo=media, caption=caption)
+            except Exception as exc:
+                logger.warning("Telegram photo upload failed, falling back to document: %s", exc)
+                media.seek(0)
+                await update.message.reply_document(document=media, caption=caption)
+        return
     with open(path, "rb") as media:
         await update.message.reply_document(document=media, caption=caption)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "👋 **Hey! Welcome!**\n\n"
-        "📥 **Instagram & Facebook Downloader**\n\n"
-        "🔗 Bas Reel, Video, Story ya Post ka link yahan paste karo.\n"
-        "⚡️ Main media process karke directly yahin send kar dunga.\n\n"
-        "**No extra steps. Just paste the link! 🚀**",
-        parse_mode="Markdown",
-    )
+    await update.message.reply_text("👋 **Hey! Welcome!**\n\n📥 **Instagram & Facebook Downloader**\n\n🔗 Bas Reel, Video, Story ya Post ka link yahan paste karo.\n⚡️ Main media process karke directly yahin send kar dunga.\n\n**No extra steps. Just paste the link! 🚀**", parse_mode="Markdown")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -286,7 +294,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     url, headers = parse_request(update.message.text)
     if not url:
-        await update.message.reply_text("🔗 **That doesn't look like a valid URL.**\n\nPlease send a video, stream, M3U8/HLS, or direct media link.", parse_mode="Markdown")
+        await update.message.reply_text("🔗 **That doesn't look like a valid URL.**\n\nPlease send a video, image, stream, M3U8/HLS, or direct media link.", parse_mode="Markdown")
         return
     _last_request[user_id] = now
     status = await update.message.reply_text("⏳ **Processing your media...**", parse_mode="Markdown")
