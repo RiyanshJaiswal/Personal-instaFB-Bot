@@ -47,8 +47,7 @@ def prepare_cookies_file() -> str | None:
     if os.path.isfile(COOKIES_FILE):
         return COOKIES_FILE
     value = COOKIES_FILE
-    looks_like_netscape = "# Netscape HTTP Cookie File" in value or "# HTTP Cookie File" in value or ("instagram.com" in value and "\t" in value)
-    if not looks_like_netscape:
+    if not ("# Netscape HTTP Cookie File" in value or "# HTTP Cookie File" in value or ("instagram.com" in value and "\t" in value)):
         logger.warning("COOKIES_FILE is set but no valid cookies.txt content was detected")
         return None
     path = os.path.join(tempfile.gettempdir(), "bot_cookies.txt")
@@ -58,28 +57,30 @@ def prepare_cookies_file() -> str | None:
             if not value.endswith("\n"):
                 fh.write("\n")
         os.chmod(path, 0o600)
-        logger.info("Cookies loaded: YES")
         return path
     except Exception:
         logger.exception("Could not create temporary cookies file")
         return None
-
 
 COOKIES_PATH = prepare_cookies_file()
 
 
 def parse_request(text: str) -> tuple[str | None, dict[str, str]]:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not lines or not URL_RE.match(lines[0]):
+    if not lines:
+        return None, {}
+    url = lines[0]
+    if not URL_RE.match(url):
         return None, {}
     headers = {"User-Agent": DEFAULT_USER_AGENT}
     for line in lines[1:]:
         if ":" not in line:
             continue
         key, value = line.split(":", 1)
-        if key.strip() and value.strip() and key.strip().lower() not in {"cookie", "authorization"}:
-            headers[key.strip()] = value.strip()
-    return lines[0], headers
+        key, value = key.strip(), value.strip()
+        if key and value and key.lower() not in {"cookie", "authorization"}:
+            headers[key] = value
+    return url, headers
 
 
 def safe_filename(name: str, fallback: str = "video") -> str:
@@ -89,7 +90,8 @@ def safe_filename(name: str, fallback: str = "video") -> str:
 
 def filename_from_url(url: str) -> str:
     path_name = Path(urlparse(url).path).name
-    return safe_filename(Path(path_name).stem if path_name else "video")
+    stem = Path(path_name).stem if path_name else "video"
+    return safe_filename(stem or "video")
 
 
 def is_too_large(path: str) -> bool:
@@ -118,23 +120,6 @@ def download_with_yt_dlp(url: str, headers: dict[str, str], out_dir: str) -> lis
     return newest_media(out_dir)
 
 
-def download_with_n_m3u8dl(url: str, headers: dict[str, str], out_dir: str) -> list[str]:
-    binary = shutil.which("N_m3u8DL-RE") or shutil.which("N_m3u8DL-RE.exe")
-    if not binary:
-        raise RuntimeError("N_m3u8DL-RE is not installed")
-    command = [binary, url, "--save-dir", out_dir, "--save-name", safe_filename(filename_from_url(url)), "--del-after-done", "--no-date-info", "--no-log", "--concurrent-download", "--download-retry-count", "5", "--http-request-timeout", "60", "--ffmpeg-binary-path", shutil.which("ffmpeg") or "/usr/bin/ffmpeg"]
-    if COOKIES_PATH:
-        cookie_header = extract_cookie_header(COOKIES_PATH, url)
-        if cookie_header:
-            command += ["-H", f"Cookie: {cookie_header}"]
-    for key, value in headers.items():
-        command += ["-H", f"{key}: {value}"]
-    result = run_process(command)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr[-2500:] or result.stdout[-2500:] or "N_m3u8DL-RE failed")
-    return newest_media(out_dir)
-
-
 def extract_cookie_header(cookie_path: str, target_url: str) -> str:
     host = (urlparse(target_url).hostname or "").lower()
     pairs = []
@@ -153,6 +138,23 @@ def extract_cookie_header(cookie_path: str, target_url: str) -> str:
     except OSError:
         return ""
     return "; ".join(pairs)
+
+
+def download_with_n_m3u8dl(url: str, headers: dict[str, str], out_dir: str) -> list[str]:
+    binary = shutil.which("N_m3u8DL-RE") or shutil.which("N_m3u8DL-RE.exe")
+    if not binary:
+        raise RuntimeError("N_m3u8DL-RE is not installed")
+    command = [binary, url, "--save-dir", out_dir, "--save-name", safe_filename(filename_from_url(url)), "--del-after-done", "--no-date-info", "--no-log", "--concurrent-download", "--download-retry-count", "5", "--http-request-timeout", "60", "--ffmpeg-binary-path", shutil.which("ffmpeg") or "/usr/bin/ffmpeg"]
+    if COOKIES_PATH:
+        cookie_header = extract_cookie_header(COOKIES_PATH, url)
+        if cookie_header:
+            command += ["-H", f"Cookie: {cookie_header}"]
+    for key, value in headers.items():
+        command += ["-H", f"{key}: {value}"]
+    result = run_process(command)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-2500:] or result.stdout[-2500:] or "N_m3u8DL-RE failed")
+    return newest_media(out_dir)
 
 
 def download_with_streamlink(url: str, headers: dict[str, str], out_dir: str) -> list[str]:
@@ -231,63 +233,75 @@ def is_telegram_video(path: str) -> bool:
     return Path(path).suffix.lower() == ".mp4"
 
 
-def probe_video(path: str) -> tuple[str | None, str | None, str | None]:
+def probe_video(path: str) -> tuple[str | None, str | None, str | None, str | None, int | None]:
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
-        return None, None, None
-    result = run_process([ffprobe, "-v", "error", "-show_entries", "stream=codec_type,codec_name,pix_fmt", "-of", "json", path], timeout=60)
+        return None, None, None, None, None
+    result = run_process([ffprobe, "-v", "error", "-show_entries", "stream=codec_type,codec_name,pix_fmt,profile,width,height", "-of", "json", path], timeout=60)
     if result.returncode != 0:
-        logger.warning("ffprobe failed: %s", result.stderr[-1000:])
-        return None, None, None
+        return None, None, None, None, None
     try:
         streams = json.loads(result.stdout).get("streams", [])
     except (json.JSONDecodeError, TypeError):
-        return None, None, None
+        return None, None, None, None, None
     video = next((s for s in streams if s.get("codec_type") == "video"), {})
     audio = next((s for s in streams if s.get("codec_type") == "audio"), {})
-    return video.get("codec_name"), audio.get("codec_name"), video.get("pix_fmt")
+    return video.get("codec_name"), audio.get("codec_name"), video.get("pix_fmt"), video.get("profile"), video.get("width")
 
 
 def ensure_telegram_compatible(path: str) -> str:
-    """Create an H.264/AAC MP4 only when the source is not Telegram-friendly."""
     if not is_telegram_video(path):
         return path
     ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg or not shutil.which("ffprobe"):
-        logger.warning("ffmpeg/ffprobe unavailable; keeping original file")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg or not ffprobe:
+        logger.warning("ffmpeg/ffprobe unavailable; skipping Telegram compatibility conversion")
         return path
 
-    video_codec, audio_codec, pix_fmt = probe_video(path)
-    if video_codec == "h264" and audio_codec in {"aac", None} and pix_fmt in {"yuv420p", "yuvj420p", None}:
+    video_codec, audio_codec, pix_fmt, profile, width = probe_video(path)
+    # iOS Telegram is stricter than desktop/Android. Force a conservative H.264/AAC MP4:
+    # Baseline/Main profile, 8-bit 4:2:0, even dimensions, no HDR/10-bit, fast-start MP4.
+    compatible = video_codec == "h264" and audio_codec == "aac" and pix_fmt == "yuv420p" and profile in {"Baseline", "Main", "Constrained Baseline"}
+    if compatible:
         return path
 
-    output = os.path.join(os.path.dirname(path), f"{Path(path).stem}_telegram.mp4")
-    command = [ffmpeg, "-y", "-i", path, "-map", "0:v:0", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", output]
-    result = run_process(command, timeout=DOWNLOAD_TIMEOUT)
+    output = os.path.join(os.path.dirname(path), f"{Path(path).stem}_ios.mp4")
+    # Scale only when necessary to even dimensions. Keep source resolution otherwise.
+    vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p"
+    result = run_process([
+        ffmpeg, "-y", "-i", path,
+        "-map", "0:v:0", "-map", "0:a?",
+        "-c:v", "libx264", "-profile:v", "main", "-level:v", "4.0",
+        "-preset", "veryfast", "-crf", "22", "-vf", vf,
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "128k", "-ar", "48000",
+        "-movflags", "+faststart",
+        output,
+    ], timeout=DOWNLOAD_TIMEOUT)
     if result.returncode != 0 or not os.path.isfile(output) or os.path.getsize(output) == 0:
-        logger.error("FFmpeg compatibility conversion failed: %s", result.stderr[-2500:])
-        # Do NOT turn a successful download into a misleading "download failed" error.
+        logger.error("iOS conversion failed: %s", result.stderr[-2500:])
         return path
+    try:
+        os.remove(path)
+    except OSError:
+        pass
     return output
 
 
 async def send_media(update: Update, path: str, caption: str) -> None:
     if is_telegram_video(path):
-        original_path = path
-        compatible_path = ensure_telegram_compatible(path)
-        upload_path = compatible_path if os.path.isfile(compatible_path) else original_path
-        if is_too_large(upload_path):
-            raise RuntimeError(f"File is too large for Telegram's current bot upload limit ({MAX_FILE_SIZE_MB} MB).")
-        with open(upload_path, "rb") as media:
+        path = ensure_telegram_compatible(path)
+        if is_too_large(path):
+            raise RuntimeError(f"Converted video is too large for Telegram's current bot upload limit ({MAX_FILE_SIZE_MB} MB).")
+        with open(path, "rb") as media:
             try:
                 await update.message.reply_video(video=media, caption=caption, supports_streaming=True)
                 return
             except Exception as exc:
                 logger.warning("Telegram video upload failed, falling back to document: %s", exc)
-        with open(upload_path, "rb") as media:
-            await update.message.reply_document(document=media, caption=caption)
-        return
-
+                media.seek(0)
+                await update.message.reply_document(document=media, caption=caption)
+                return
     with open(path, "rb") as media:
         await update.message.reply_document(document=media, caption=caption)
 
@@ -313,12 +327,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     status = await update.message.reply_text("⏳ **Processing your media...**", parse_mode="Markdown")
     with tempfile.TemporaryDirectory(prefix="tgdl_") as work_dir:
         try:
-            files = [f for f in await process_url(url, headers, work_dir) if os.path.isfile(f)]
+            files = await process_url(url, headers, work_dir)
+            files = [f for f in files if os.path.isfile(f)]
             if not files:
                 raise RuntimeError("No media file was produced")
             files = [f for f in files if not is_too_large(f)]
             if not files:
-                await status.edit_text(f"❌ **File is too large for Telegram's current bot upload limit ({MAX_FILE_SIZE_MB} MB).**")
+                await status.edit_text(f"❌ **File is too large for Telegram's current bot upload limit ({MAX_FILE_SIZE_MB} MB).")
                 return
             await status.edit_text("📤 **Almost there!**\n\nYour media is ready — sending it now... ✨", parse_mode="Markdown")
             for index, path in enumerate(files[:10]):
@@ -337,7 +352,6 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling(drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()
