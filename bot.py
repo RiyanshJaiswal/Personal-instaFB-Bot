@@ -45,16 +45,13 @@ def prepare_cookies_file() -> str | None:
     if not value:
         return None
 
-    # Normal/local deployment: variable contains a path such as cookies.txt.
     if os.path.isfile(value):
         return value
 
-    # Railway: variable contains the actual cookies.txt contents.
-    # Netscape cookie files normally contain this header and tab-separated rows.
     looks_like_cookie_content = (
         "# Netscape HTTP Cookie File" in value
         or "# HTTP Cookie File" in value
-        or "instagram.com" in value and "\t" in value
+        or ("instagram.com" in value and "\t" in value)
     )
     if looks_like_cookie_content:
         cookie_path = os.path.join(tempfile.gettempdir(), "instagram_cookies.txt")
@@ -86,8 +83,11 @@ _last_request: dict[int, float] = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Instagram ya Facebook video/reel ka link bhejo, main download karke bhej dunga.\n"
-        "(Sirf videos/reels — photo-only posts support nahi hain.)"
+        "👋 Hey! Welcome!\n\n"
+        "📥 Instagram & Facebook Downloader\n\n"
+        "🔗 Bas Reel, Video, Story ya Post ka link yahan paste karo.\n"
+        "⚡ Main media process karke directly yahin send kar dunga.\n\n"
+        "No extra steps. Just paste the link! 🚀"
     )
 
 
@@ -98,7 +98,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if not match:
         await update.message.reply_text(
-            "Ye valid Instagram/Facebook link nahi lag raha. Poora link paste karo."
+            "🔗 That doesn't look like a valid link.\n\n"
+            "Please send an Instagram or Facebook Reel, Video, Story, or Post link and I'll take care of the rest. ⚡"
         )
         return
 
@@ -110,7 +111,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     _last_request[user_id] = now
 
     url = match.group(0)
-    status_msg = await update.message.reply_text("Downloading... ⏳")
+    status_msg = await update.message.reply_text("⏳ Processing your media...\n\nPlease wait a moment. 🚀")
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         out_template = os.path.join(tmp_dir, f"{uuid.uuid4().hex}_%(autonumber)03d.%(ext)s")
@@ -132,7 +133,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             info = {}
         except Exception:
             logger.exception("Unexpected error while downloading %s", url)
-            await status_msg.edit_text("Kuch gadbad ho gayi. Thodi der baad try karo.")
+            await status_msg.edit_text(
+                "❌ Couldn't download this media.\n\n"
+                "Please check the link and try again."
+            )
             return
 
         caption = (info.get("description") or "").strip()
@@ -142,7 +146,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         video_exts = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
         video_files = sorted(
             (
-                f for f in glob.glob(os.path.join(tmp_dir, "*"))
+                f
+                for f in glob.glob(os.path.join(tmp_dir, "*"))
                 if os.path.splitext(f)[1].lower() in video_exts
             ),
             key=os.path.getmtime,
@@ -168,7 +173,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         image_exts = {".jpg", ".jpeg", ".png", ".webp"}
         image_files = sorted(
             (
-                f for f in glob.glob(os.path.join(image_dir, "**", "*"), recursive=True)
+                f
+                for f in glob.glob(os.path.join(image_dir, "**", "*"), recursive=True)
                 if os.path.splitext(f)[1].lower() in image_exts
             ),
             key=os.path.getmtime,
@@ -190,8 +196,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         all_files = video_files + image_files
         if not all_files:
             await status_msg.edit_text(
-                "Kuch download nahi ho paya — post private ho sakta hai, "
-                "ya isake liye login/cookies chahiye."
+                "❌ Couldn't download this media.\n\n"
+                "This may happen if:\n"
+                "🔒 The content is private or login-only\n"
+                "⏳ The link has expired\n"
+                "🚫 Instagram/Facebook is restricting access\n"
+                "🔗 The link is invalid\n\n"
+                "Please check the link and try again."
             )
             return
 
@@ -204,11 +215,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         if not ok_files:
             await status_msg.edit_text(
-                f"Saari file(s) {MAX_FILE_SIZE_MB}MB limit se badi hain, bhej nahi sakta."
+                f"⚠️ The media is larger than the {MAX_FILE_SIZE_MB}MB Telegram limit, so I can't send it."
             )
             return
 
-        await status_msg.edit_text("Uploading... 📤")
+        await status_msg.edit_text("📤 Almost there!\n\nYour media is ready — sending it now... ✨")
         opened = []
         try:
             if len(ok_files) == 1:
@@ -233,11 +244,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await status_msg.delete()
             if skipped:
                 await update.message.reply_text(
-                    f"{skipped} file(s) {MAX_FILE_SIZE_MB}MB limit se badi thi, skip kar di."
+                    f"⚠️ {skipped} file(s) exceeded the {MAX_FILE_SIZE_MB}MB Telegram limit and were skipped."
                 )
         except Exception:
             logger.exception("Unexpected error while uploading to Telegram")
-            await status_msg.edit_text("Download ho gaya par Telegram par bhejne mein error aaya.")
+            await status_msg.edit_text(
+                "❌ The download finished, but I couldn't send the media to Telegram.\n\nPlease try again."
+            )
         finally:
             for fh in opened:
                 fh.close()
