@@ -1,100 +1,88 @@
-# Instagram / Facebook Video Downloader — Telegram Bot
+# Universal Media Downloader — Telegram Bot
 
-Link bhejo, video wapas milega. Backend mein `yt-dlp` use hota hai (koi official
-IG/FB API nahi hai jo ye karta ho — dono platforms unofficial/scraping route se
-hi kaam karte hain, isliye reliability 100% guaranteed nahi hai).
+Send a URL to Telegram and the bot downloads the media server-side and sends it back.
 
-## 1. Bot token lo
+## Downloader stack
 
-1. Telegram par **@BotFather** ko message karo.
-2. `/newbot` bhejo, naam aur username choose karo.
-3. Jo token milega (kuch aisa dikhega: `123456789:ABCdefGhIJKlmNoPQRsTUVwxyz`) — usko save karo.
+The bot uses multiple engines instead of relying on one extractor:
 
-## 2. Install karo
+1. **yt-dlp** — primary website/video extractor, including supported social/video sites and many HLS/DASH cases.
+2. **N_m3u8DL-RE v0.6.0-beta** — dedicated HLS/M3U8/DASH/MSS fallback.
+3. **Streamlink** — streaming fallback.
+4. **FFmpeg** — mux/remux/format handling.
+5. **httpx** — direct media-file downloads.
 
-```bash
-# ffmpeg zaroori hai (audio+video merge ke liye kabhi kabhi)
-sudo apt install ffmpeg        # Linux
-brew install ffmpeg            # Mac
+The Docker image installs FFmpeg and the Linux x64 N_m3u8DL-RE build automatically.
 
-pip install -r requirements.txt
+## Telegram usage
+
+Send simply:
+
+```text
+https://example.com/video
 ```
 
-## 3. (Recommended) Instagram cookies set karo
+For a stream that requires browser-style headers, the bot also accepts:
 
-2026 mein Instagram ka zyadatar content bina login ke fail ho jaata hai. Reliable
-kaam karwane ke liye:
-
-1. Chrome/Firefox mein ek **throwaway/secondary** Instagram account se login karo
-   (apna main account mat use karo — heavy automated use se account action-block
-   ho sakta hai).
-2. "Get cookies.txt LOCALLY" jaisi browser extension se instagram.com ki cookies
-   export karo.
-3. Railway par **`COOKIES_FILE` environment variable** set karo. Iska value cookie
-   file ka path hoga (default: `cookies.txt`).
-4. Agar cookies file Railway container mein available nahi hai, to bot usse use nahi
-   kar payega. Cookies ko GitHub public repo mein commit mat karo, kyunki usme live
-   login session ho sakta hai.
-
-Facebook public videos usually bina login ke bhi chal jaate hain.
-
-## 4. Run karo
-
-```bash
-export BOT_TOKEN="yahan_apna_token_daalo"
-python3 bot.py
+```text
+https://example.com/video.m3u8
+Referer: https://example.com/watch
+User-Agent: Mozilla/5.0
 ```
 
-Telegram par apne bot ko koi bhi Instagram/Facebook video ka link bhejo.
+`Cookie` and `Authorization` headers are intentionally not accepted from Telegram text. Sensitive session data should stay in the secure `COOKIES_FILE` environment variable.
 
-## Free deploy (Railway) — low-traffic personal use
+## Environment variables
 
-This bot uses **polling**, so it needs to stay running — that rules out
-serverless/sleep-after-idle free tiers (Render, Vercel). Railway works well
-for a low-traffic personal bot:
+| Variable | Default | Purpose |
+|---|---:|---|
+| `BOT_TOKEN` | required | Telegram BotFather token |
+| `COOKIES_FILE` | empty | Netscape `cookies.txt` path or inline cookie-file content |
+| `MAX_FILE_SIZE_MB` | `50` | Maximum file sent through the normal Telegram Bot API |
+| `COOLDOWN_SECONDS` | `5` | Per-user request cooldown |
+| `DOWNLOAD_TIMEOUT` | `1800` | Downloader process timeout in seconds |
+| `DEFAULT_USER_AGENT` | Chrome-like UA | Default HTTP User-Agent |
 
-1. Push this folder (`bot.py`, `requirements.txt`, `Dockerfile`) to a **GitHub repo**.
-2. Go to [railway.app](https://railway.app) → sign up (no card needed for the trial) →
-   **New Project → Deploy from GitHub repo** → pick your repo.
-3. Railway detects the `Dockerfile` automatically and builds it (ffmpeg included).
-4. In the service's **Variables** tab, add `BOT_TOKEN`, `COOKIES_FILE`, and optionally
-   `COOLDOWN_SECONDS` / `MAX_FILE_SIZE_MB`.
-5. Deploy. Check the **Logs** tab for `Bot started, polling...`.
-6. For Instagram cookies, make sure the cookie file is actually available to the
-   Railway container at the path configured by `COOKIES_FILE`. Do not commit live
-   cookies to a public repository; use a secure runtime mechanism or a Railway
-   volume/file mount.
+### Cookies on Railway
 
-At ~100 requests/day this comfortably stays inside Railway's free monthly credit,
-so it should cost nothing.
+`COOKIES_FILE` can contain the complete Netscape/Mozilla cookie-file content. The bot writes it to a temporary file at startup and never logs the cookie values.
 
-**More permanent free alternative:** an Oracle Cloud "Always Free" ARM VM — genuinely
-free forever (no credit that runs out), but you set it up as a real Linux server
-yourself (SSH in, install Docker, `docker run` this image, keep it alive with
-`systemd` or `docker restart=always`). More setup work, more control.
+The cookie file must start with either:
 
-Avoid the many small "free Telegram bot hosting" sites floating around — handing
-your bot token to an unfamiliar third-party host is a real risk, since the token
-gives full control of the bot.
+```text
+# Netscape HTTP Cookie File
+```
 
-## Config (optional env vars)
+or
 
-| Variable | Default | Kya karta hai |
-|---|---|---|
-| `BOT_TOKEN` | — (required) | BotFather wala token |
-| `COOKIES_FILE` | `cookies.txt` | Instagram cookies file ka path |
-| `MAX_FILE_SIZE_MB` | `50` | Telegram bot API ki hard limit hi 50MB hai |
-| `COOLDOWN_SECONDS` | `15` | Per-user cooldown, taaki IG/FB ban na kare |
+```text
+# HTTP Cookie File
+```
 
-## Limitations / good-to-know
+Never commit live cookies or bot tokens to GitHub.
 
-- **Sirf videos/reels** — photo-only posts support nahi hain.
-- **50MB file limit** — Telegram Bot API ka hard cap hai. Local Bot API server
-  self-host karke 2GB tak badha sakte ho, but ye setup extra kaam hai — abhi
-  isme nahi kiya.
-- **Ye break ho sakta hai** — Instagram/Facebook apna internal structure change
-  karte rehte hain, to kabhi kabhi `yt-dlp` update karna padega:
-  `pip install -U yt-dlp`
-- **ToS/copyright**: scraping Instagram/Facebook ke ToS ke against hai. Apna
-  content ya jisko download karne ki permission ho, uske liye use karo — doosron
-  ka content redistribute/repost mat karo.
+## Local run
+
+Install Python dependencies and FFmpeg, then:
+
+```bash
+export BOT_TOKEN="YOUR_TOKEN"
+python bot.py
+```
+
+## Railway
+
+Railway should use the included `Dockerfile`. It installs:
+
+- Python 3.13
+- FFmpeg
+- N_m3u8DL-RE v0.6.0-beta Linux x64
+- Python downloader dependencies
+
+Set `BOT_TOKEN` and, when needed, `COOKIES_FILE` in Railway Variables.
+
+## Important limitation
+
+A media URL copied from another machine may fail when replayed from Railway if the provider binds the request to the original IP, cookies, Referer, or other HTTP headers. For that reason the next desktop-helper phase will send the relevant URL and request metadata from the laptop to this bot.
+
+Use this only for media you are authorized to download.
