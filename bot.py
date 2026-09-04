@@ -1,4 +1,4 @@
-"""Instagram/Facebook media downloader bot."""
+"""Instagram, Facebook and Threads media downloader bot."""
 
 import glob
 import json
@@ -272,7 +272,7 @@ async def process_url(url: str, headers: dict[str, str], work_dir: str) -> tuple
     manifest = bool(MANIFEST_RE.search(url.lower()))
     suffix = Path(urlparse(url).path).suffix.lower()
     host = (urlparse(url).hostname or "").lower()
-    is_social = host.endswith("instagram.com") or host.endswith("facebook.com") or host.endswith("fb.watch")
+    is_social = (\n        host.endswith("instagram.com")\n        or host.endswith("facebook.com")\n        or host.endswith("fb.watch")\n        or host.endswith("threads.com")\n        or host.endswith("threads.net")\n    )
 
     if suffix in DIRECT_EXTENSIONS:
         try:
@@ -379,8 +379,8 @@ async def send_image_album(update: Update, files: list[str], caption: str) -> No
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 **Hey! Welcome!**\n\n"
-        "📥 **Instagram & Facebook Downloader**\n\n"
-        "🔗 Bas Reel, Video, Story ya Post ka link yahan paste karo.\n"
+        "📥 **Instagram, Facebook & Threads Downloader**\n\n"
+        "🔗 Bas Reel, Video, Story, Post ya Threads link yahan paste karo.\n"
         "⚡️ Main media process karke directly yahin send kar dunga.\n\n"
         "**No extra steps. Just paste the link! 🚀**",
         parse_mode="Markdown",
