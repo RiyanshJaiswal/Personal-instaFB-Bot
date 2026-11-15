@@ -165,7 +165,8 @@ def run_process(command: list[str], timeout: int = DOWNLOAD_TIMEOUT) -> subproce
 def download_with_yt_dlp(url: str, headers: dict[str, str], out_dir: str) -> tuple[list[str], str]:
     output = os.path.join(out_dir, f"{uuid.uuid4().hex}_%(title).120s.%(ext)s")
     opts = {
-        "outtmpl": output, "format": "bestvideo*+bestaudio/best", "merge_output_format": "mp4",
+        "outtmpl": output, "format": "bv*[vcodec^=avc]+ba[acodec^=mp4a]/bv*[vcodec^=avc]+ba/bv*+ba/b", "merge_output_format": "mp4",
+        "format_sort": ["vcodec:h264", "res", "acodec:aac"],
         "noplaylist": True, "playlist_items": "1-10", "quiet": True, "no_warnings": True, "retries": 3,
         "fragment_retries": 5, "concurrent_fragment_downloads": 4,
         "http_headers": headers, "socket_timeout": 30,
@@ -343,23 +344,63 @@ async def process_url(url: str, headers: dict[str, str], work_dir: str) -> tuple
         raise RuntimeError("All available download engines failed") from exc
 
 
+def probe_video(path: str) -> dict:
+    """Return codec/size info for the first video stream (empty dict if none)."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return {}
+    try:
+        r = run_process([ffprobe, "-v", "error", "-print_format", "json", "-show_streams", "-show_format", path], timeout=60)
+        data = json.loads(r.stdout or "{}")
+    except Exception:
+        return {}
+    video = next((x for x in data.get("streams", []) if x.get("codec_type") == "video"), None)
+    audio = next((x for x in data.get("streams", []) if x.get("codec_type") == "audio"), None)
+    if not video:
+        return {}
+    try:
+        duration = int(float(data.get("format", {}).get("duration", 0)))
+    except (TypeError, ValueError):
+        duration = 0
+    return {
+        "vcodec": video.get("codec_name"), "pix_fmt": video.get("pix_fmt"),
+        "width": video.get("width"), "height": video.get("height"),
+        "acodec": audio.get("codec_name") if audio else None, "duration": duration,
+        "container": data.get("format", {}).get("format_name", ""),
+    }
+
+
 def ensure_telegram_compatible(path: str) -> str:
-    if not is_video(path) or Path(path).suffix.lower() != ".mp4":
+    """Make sure the video is H.264 + yuv420p + AAC in an MP4 so Telegram plays the picture, not only audio."""
+    if not is_video(path):
         return path
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         return path
-    output = os.path.join(os.path.dirname(path), f"{Path(path).stem}_ios.mp4")
-    vf = "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p"
-    command = [ffmpeg, "-y", "-i", path, "-map", "0:v:0", "-map", "0:a:0?", "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-profile:v", "main", "-level:v", "4.0", "-pix_fmt", "yuv420p", "-tag:v", "avc1", "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "128k", "-ar", "48000", "-ac", "2", "-map_metadata", "-1", "-movflags", "+faststart", output]
+    info = probe_video(path)
+    already_ok = (
+        info.get("vcodec") == "h264" and info.get("pix_fmt") == "yuv420p"
+        and info.get("acodec") in (None, "aac") and "mp4" in info.get("container", "")
+        and Path(path).suffix.lower() in {".mp4", ".m4v", ".mov"}
+        and (info.get("width") or 0) <= 1920 and (info.get("height") or 0) <= 1920
+    )
+    output = os.path.join(os.path.dirname(path), f"{Path(path).stem}_tg.mp4")
+    if already_ok:
+        command = [ffmpeg, "-y", "-i", path, "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-movflags", "+faststart", output]
+    else:
+        vf = "scale=w='min(1920,iw)':h='min(1920,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p"
+        command = [ffmpeg, "-y", "-i", path, "-map", "0:v:0", "-map", "0:a:0?", "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-profile:v", "high", "-level:v", "4.2", "-pix_fmt", "yuv420p", "-tag:v", "avc1", "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2", "-map_metadata", "-1", "-movflags", "+faststart", output]
     result = run_process(command, timeout=DOWNLOAD_TIMEOUT)
     if result.returncode != 0 or not os.path.isfile(output) or os.path.getsize(output) == 0:
-        logger.error("iOS MP4 conversion failed: %s", result.stderr[-3000:])
-        return path
-    try:
-        os.remove(path)
-    except OSError:
-        pass
+        logger.error("Telegram MP4 conversion failed: %s", result.stderr[-3000:])
+        if already_ok:
+            return path
+        raise RuntimeError("Could not convert this video to a Telegram-compatible format")
+    if path != output:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
     return output
 
 
@@ -370,7 +411,8 @@ async def send_single(update: Update, path: str, caption: str) -> None:
             raise RuntimeError(f"Converted video is too large for Telegram's current bot upload limit ({MAX_FILE_SIZE_MB} MB).")
         with open(path, "rb") as media:
             try:
-                await update.message.reply_video(video=media, caption=caption, supports_streaming=True)
+                meta = probe_video(path)
+                await update.message.reply_video(video=media, caption=caption, supports_streaming=True, width=meta.get("width"), height=meta.get("height"), duration=meta.get("duration"))
             except Exception as exc:
                 logger.warning("Telegram video upload failed, falling back to document: %s", exc)
                 media.seek(0)
