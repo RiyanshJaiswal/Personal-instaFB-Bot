@@ -376,7 +376,7 @@ def ensure_telegram_compatible(path: str) -> str:
         return path
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
-        return path
+        raise RuntimeError("FFmpeg is required to prepare videos for Telegram")
     info = probe_video(path)
     already_ok = (
         info.get("vcodec") == "h264" and info.get("pix_fmt") == "yuv420p"
@@ -411,7 +411,7 @@ async def send_single(update: Update, path: str, caption: str) -> None:
             raise RuntimeError(f"Converted video is too large for Telegram's current bot upload limit ({MAX_FILE_SIZE_MB} MB).")
         with open(path, "rb") as media:
             try:
-                meta = probe_video(path)
+                meta = await asyncio.to_thread(probe_video, path)
                 await update.message.reply_video(video=media, caption=caption, supports_streaming=True, width=meta.get("width"), height=meta.get("height"), duration=meta.get("duration"))
             except Exception as exc:
                 logger.warning("Telegram video upload failed, falling back to document: %s", exc)
@@ -480,7 +480,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     with tempfile.TemporaryDirectory(prefix="tgdl_") as work_dir:
         try:
             files, caption = await process_url(url, headers, work_dir)
-            files = [f for f in files if os.path.isfile(f) and not is_too_large(f)]
+            files = [f for f in files if os.path.isfile(f) and (not is_too_large(f) or is_video(f))]
             if not files:
                 raise RuntimeError("No media file was produced")
             caption = clean_caption(caption, filename_caption(files[0]))
