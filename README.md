@@ -37,6 +37,7 @@ User-Agent: Mozilla/5.0
 | Variable | Default | Purpose |
 |---|---:|---|
 | `BOT_TOKEN` | required | Telegram BotFather token |
+| `ALLOWED_USER_IDS` | empty (open to all) | Comma-separated Telegram user IDs allowed to use the bot — **set this** |
 | `COOKIES_FILE` | empty | Netscape `cookies.txt` path or inline cookie-file content |
 | `MAX_FILE_SIZE_MB` | `50` | Maximum file sent through the normal Telegram Bot API |
 | `COOLDOWN_SECONDS` | `5` | Per-user request cooldown |
