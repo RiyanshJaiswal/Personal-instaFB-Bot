@@ -168,7 +168,7 @@ def download_with_yt_dlp(url: str, headers: dict[str, str], out_dir: str) -> tup
     opts = {
         "outtmpl": output, "format": "bv*[vcodec^=avc]+ba[acodec^=mp4a]/bv*[vcodec^=avc]+ba/bv*+ba/b", "merge_output_format": "mp4",
         "format_sort": ["vcodec:h264", "res", "acodec:aac"],
-        "noplaylist": True, "playlist_items": "1-10", "quiet": True, "no_warnings": True, "retries": 3,
+        "noplaylist": True, "playlist_items": "1-20", "ignoreerrors": True, "quiet": True, "no_warnings": True, "retries": 3,
         "fragment_retries": 5, "concurrent_fragment_downloads": 4,
         "http_headers": headers, "socket_timeout": 30,
     }
@@ -213,7 +213,7 @@ def download_with_gallery_dl(url: str, out_dir: str) -> tuple[list[str], str]:
     if COOKIES_PATH:
         command += ["--cookies", COOKIES_PATH]
     command += [url]
-    result = run_process(command)
+    result = run_process(command, timeout=min(DOWNLOAD_TIMEOUT, 180))
     files = newest_media(out_dir)
     if result.returncode != 0 and not files:
         raise RuntimeError(result.stderr[-3000:] or result.stdout[-3000:] or "gallery-dl failed")
@@ -337,6 +337,7 @@ async def process_url(url: str, headers: dict[str, str], work_dir: str) -> tuple
             return await asyncio.to_thread(download_with_gallery_dl, url, work_dir)
         except Exception as exc:
             logger.warning("gallery-dl image fallback failed: %s", exc)
+            raise RuntimeError("No downloadable media was found in this social post") from exc
 
     try:
         return await asyncio.to_thread(download_with_streamlink, url, headers, work_dir)
