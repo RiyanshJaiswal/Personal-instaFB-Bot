@@ -44,9 +44,9 @@ User-Agent: Mozilla/5.0
 | `DOWNLOAD_TIMEOUT` | `1800` | Downloader process timeout in seconds |
 | `DEFAULT_USER_AGENT` | Chrome-like UA | Default HTTP User-Agent |
 
-### Cookies on Railway
+### Cookies
 
-`COOKIES_FILE` can contain the complete Netscape/Mozilla cookie-file content. The bot writes it to a temporary file at startup and never logs the cookie values.
+`COOKIES_FILE` can be a path to a `cookies.txt` file or the complete Netscape/Mozilla cookie-file content. The bot writes it to a temporary file at startup and never logs the cookie values.
 
 The cookie file must start with either:
 
@@ -71,19 +71,36 @@ export BOT_TOKEN="YOUR_TOKEN"
 python bot.py
 ```
 
-## Railway
+## Deploy on an Oracle Cloud VM (Docker)
 
-Railway should use the included `Dockerfile`. It installs:
+```bash
+git clone https://github.com/RiyanshJaiswal/Personal-instaFB-Bot.git
+cd Personal-instaFB-Bot
+docker build -t tg-media-bot .
+docker run -d --name tg-media-bot --restart unless-stopped \
+  -e BOT_TOKEN="YOUR_TOKEN" \
+  -e ALLOWED_USER_IDS="123456789" \
+  tg-media-bot
+```
 
-- Python 3.13
-- FFmpeg
-- N_m3u8DL-RE v0.6.0-beta Linux x64
-- Python downloader dependencies
+To use cookies, keep `cookies.txt` on the VM (never commit it) and mount it:
 
-Set `BOT_TOKEN` and, when needed, `COOKIES_FILE` in Railway Variables.
+```bash
+docker run -d --name tg-media-bot --restart unless-stopped \
+  -e BOT_TOKEN="YOUR_TOKEN" \
+  -e ALLOWED_USER_IDS="123456789" \
+  -e COOKIES_FILE=/data/cookies.txt \
+  -v /home/ubuntu/cookies.txt:/data/cookies.txt:ro \
+  tg-media-bot
+```
+
+Update: `git pull && docker build -t tg-media-bot . && docker rm -f tg-media-bot`, then run it again. Logs: `docker logs -f tg-media-bot`.
+
+The Docker image installs Python 3.13, FFmpeg, N_m3u8DL-RE v0.6.0-beta (Linux x64) and the Python dependencies. If your Oracle VM is ARM (Ampere A1), the x64 N_m3u8DL-RE binary will not run; use an AMD (x86) VM shape or install the arm64 build.
 
 ## Important limitation
 
-A media URL copied from another machine may fail when replayed from Railway if the provider binds the request to the original IP, cookies, Referer, or other HTTP headers. For that reason the next desktop-helper phase will send the relevant URL and request metadata from the laptop to this bot.
+A media URL copied from another machine may fail when replayed from this server if the provider binds the request to the original IP, cookies, Referer, or other HTTP headers. For that reason the next desktop-helper phase will send the relevant URL and request metadata from the laptop to this bot.
 
 Use this only for media you are authorized to download.
+
