@@ -92,7 +92,8 @@ COOKIES_PATH = prepare_cookies_file()
 
 
 def is_allowed(user_id: int) -> bool:
-    return user_id in ALLOWED_USERS
+    """If ALLOWED_USERS is empty the bot is open to everyone; otherwise only listed users may use it."""
+    return not ALLOWED_USERS or user_id in ALLOWED_USERS
 
 
 def is_safe_url(url: str) -> bool:
@@ -622,10 +623,10 @@ def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is not set")
     if not ALLOWED_USERS:
-        raise SystemExit("ALLOWED_USERS is not set (comma-separated Telegram user IDs). Refusing to run an open bot.")
+        logger.warning("ALLOWED_USERS is not set: anyone who finds the bot can use it (and your server's bandwidth/cookies).")
     logger.info(
-        "Starting bot | users=%d | cookies=%s | gallery-dl=%s | N_m3u8DL-RE=%s | ffmpeg=%s | streamlink=%s",
-        len(ALLOWED_USERS), "YES" if COOKIES_PATH else "NO", "YES" if shutil.which("gallery-dl") else "NO",
+        "Starting bot | users=%s | cookies=%s | gallery-dl=%s | N_m3u8DL-RE=%s | ffmpeg=%s | streamlink=%s",
+        len(ALLOWED_USERS) or "everyone", "YES" if COOKIES_PATH else "NO", "YES" if shutil.which("gallery-dl") else "NO",
         "YES" if shutil.which("N_m3u8DL-RE") else "NO", "YES" if shutil.which("ffmpeg") else "NO", "YES" if streamlink else "NO",
     )
     app = (

@@ -34,7 +34,7 @@ Session data belongs in the `COOKIES_FILE` environment variable.
 | Variable | Default | Purpose |
 |---|---:|---|
 | `BOT_TOKEN` | required | Telegram BotFather token |
-| `ALLOWED_USERS` | **required** | Comma-separated Telegram numeric user IDs allowed to use the bot (get yours from `@userinfobot`). The bot refuses to start without it. |
+| `ALLOWED_USERS` | empty | Optional comma-separated Telegram numeric user IDs allowed to use the bot (get yours from `@userinfobot`). **If empty, anyone can use the bot.** |
 | `COOKIES_FILE` | empty | Netscape `cookies.txt` path or inline cookie-file content |
 | `MAX_FILE_SIZE_MB` | `50` | Max file size (Telegram's standard Bot API limit is 50 MB) |
 | `COOLDOWN_SECONDS` | `5` | Per-user request cooldown |
@@ -47,7 +47,7 @@ See `.env.example`. Never commit `.env`, cookies, or bot tokens.
 
 ## Security notes
 
-- **Allowlist:** only users in `ALLOWED_USERS` get a response; everyone else is silently ignored.
+- **Allowlist (optional):** set `ALLOWED_USERS` to restrict the bot to specific Telegram users; others are silently ignored. If it's empty the bot is open to everyone who finds it.
 - **SSRF guard:** URLs resolving to private, loopback, link-local (incl. cloud metadata `169.254.169.254`) or reserved IPs are rejected, and direct-download redirects are re-validated on every hop. yt-dlp/gallery-dl follow their own redirects and DNS rebinding isn't covered, so on cloud VMs also block the metadata endpoint at the firewall:
   ```bash
   sudo iptables -I OUTPUT -d 169.254.169.254 -j REJECT
@@ -84,7 +84,6 @@ Housekeeping: `docker system prune -f` occasionally (weekly cron) to reclaim dis
 ```bash
 pip install -r requirements.txt   # plus ffmpeg on your system
 export BOT_TOKEN="YOUR_TOKEN"
-export ALLOWED_USERS="123456789"
 python bot.py
 ```
 
