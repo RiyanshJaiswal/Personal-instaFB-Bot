@@ -25,4 +25,9 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY bot.py .
 
+# Run as non-root
+RUN useradd -m botuser
+USER botuser
+
 CMD ["python", "bot.py"]
+
