@@ -1,12 +1,15 @@
 """Instagram, Facebook and Threads media downloader bot."""
 
+import asyncio
 import glob
+import ipaddress
 import json
 import logging
 import mimetypes
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -29,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 COOKIES_FILE = os.environ.get("COOKIES_FILE", "").strip()
-MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "120"))
+MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "5"))
 DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "1800"))
 DEFAULT_USER_AGENT = os.environ.get(
@@ -37,6 +40,7 @@ DEFAULT_USER_AGENT = os.environ.get(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
 )
+ALLOWED_USER_IDS = {int(x) for x in re.findall(r"\d+", os.environ.get("ALLOWED_USER_IDS", ""))}
 URL_RE = re.compile(r"^https?://\S+$", re.I)
 MANIFEST_RE = re.compile(r"\.(m3u8|m3u|mpd)(?:$|[?#])", re.I)
 VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".ts"}
@@ -83,6 +87,31 @@ def parse_request(text: str) -> tuple[str | None, dict[str, str]]:
         if key.strip() and value.strip() and key.strip().lower() not in {"cookie", "authorization"}:
             headers[key.strip()] = value.strip()
     return lines[0], headers
+
+
+def _is_public_host(host: str) -> bool:
+    """Reject hosts that resolve to private/loopback/link-local/reserved addresses."""
+    if not host:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return False
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if not ip.is_global:
+            return False
+    return True
+
+
+async def ensure_public_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not await asyncio.to_thread(_is_public_host, parsed.hostname or ""):
+        raise RuntimeError("This URL is not allowed")
+
+
+async def _check_request(request: httpx.Request) -> None:
+    await ensure_public_url(str(request.url))
 
 
 def safe_filename(name: str, fallback: str = "media") -> str:
@@ -137,7 +166,7 @@ def download_with_yt_dlp(url: str, headers: dict[str, str], out_dir: str) -> tup
     output = os.path.join(out_dir, f"{uuid.uuid4().hex}_%(title).120s.%(ext)s")
     opts = {
         "outtmpl": output, "format": "bestvideo*+bestaudio/best", "merge_output_format": "mp4",
-        "noplaylist": False, "quiet": True, "no_warnings": True, "retries": 3,
+        "noplaylist": True, "playlist_items": "1-10", "quiet": True, "no_warnings": True, "retries": 3,
         "fragment_retries": 5, "concurrent_fragment_downloads": 4,
         "http_headers": headers, "socket_timeout": 30,
     }
@@ -253,7 +282,7 @@ async def download_direct(url: str, headers: dict[str, str], out_dir: str) -> tu
     if not Path(filename).suffix:
         filename += ".mp4"
     path = os.path.join(out_dir, safe_filename(filename))
-    async with httpx.AsyncClient(follow_redirects=True, timeout=None, headers=headers) as client:
+    async with httpx.AsyncClient(follow_redirects=True, max_redirects=5, timeout=120, headers=headers, event_hooks={"request": [_check_request]}) as client:
         async with client.stream("GET", url) as response:
             response.raise_for_status()
             content_type = response.headers.get("content-type", "").lower()
@@ -269,10 +298,11 @@ async def download_direct(url: str, headers: dict[str, str], out_dir: str) -> tu
 
 
 async def process_url(url: str, headers: dict[str, str], work_dir: str) -> tuple[list[str], str]:
+    await ensure_public_url(url)
     manifest = bool(MANIFEST_RE.search(url.lower()))
     suffix = Path(urlparse(url).path).suffix.lower()
     host = (urlparse(url).hostname or "").lower()
-    is_social = (\n        host.endswith("instagram.com")\n        or host.endswith("facebook.com")\n        or host.endswith("fb.watch")\n        or host.endswith("threads.com")\n        or host.endswith("threads.net")\n    )
+    is_social = host.endswith(("instagram.com", "facebook.com", "fb.watch", "threads.com", "threads.net"))
 
     if suffix in DIRECT_EXTENSIONS:
         try:
@@ -284,17 +314,17 @@ async def process_url(url: str, headers: dict[str, str], work_dir: str) -> tuple
 
     if manifest:
         try:
-            return download_with_n_m3u8dl(url, headers, work_dir)
+            return await asyncio.to_thread(download_with_n_m3u8dl, url, headers, work_dir)
         except Exception as exc:
             logger.warning("N_m3u8DL-RE failed: %s", exc)
         try:
-            return download_with_yt_dlp(url, headers, work_dir)
+            return await asyncio.to_thread(download_with_yt_dlp, url, headers, work_dir)
         except Exception as exc:
             logger.warning("yt-dlp manifest fallback failed: %s", exc)
-        return download_with_streamlink(url, headers, work_dir)
+        return await asyncio.to_thread(download_with_streamlink, url, headers, work_dir)
 
     try:
-        files, caption = download_with_yt_dlp(url, headers, work_dir)
+        files, caption = await asyncio.to_thread(download_with_yt_dlp, url, headers, work_dir)
         if files:
             return files, caption
     except Exception as exc:
@@ -302,12 +332,12 @@ async def process_url(url: str, headers: dict[str, str], work_dir: str) -> tuple
 
     if is_social:
         try:
-            return download_with_gallery_dl(url, work_dir)
+            return await asyncio.to_thread(download_with_gallery_dl, url, work_dir)
         except Exception as exc:
             logger.warning("gallery-dl image fallback failed: %s", exc)
 
     try:
-        return download_with_streamlink(url, headers, work_dir)
+        return await asyncio.to_thread(download_with_streamlink, url, headers, work_dir)
     except Exception as exc:
         logger.warning("Streamlink failed: %s", exc)
         raise RuntimeError("All available download engines failed") from exc
@@ -335,7 +365,7 @@ def ensure_telegram_compatible(path: str) -> str:
 
 async def send_single(update: Update, path: str, caption: str) -> None:
     if is_video(path):
-        path = ensure_telegram_compatible(path)
+        path = await asyncio.to_thread(ensure_telegram_compatible, path)
         if is_too_large(path):
             raise RuntimeError(f"Converted video is too large for Telegram's current bot upload limit ({MAX_FILE_SIZE_MB} MB).")
         with open(path, "rb") as media:
@@ -391,6 +421,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not update.message or not update.message.text:
         return
     user_id = update.effective_user.id if update.effective_user else 0
+    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("⛔ You are not authorized to use this bot.")
+        return
     now = time.time()
     wait_left = COOLDOWN_SECONDS - (now - _last_request.get(user_id, 0))
     if wait_left > 0:
@@ -422,8 +455,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             logger.exception("Download failed for %s", url)
             await status.edit_text(
                 "❌ **Couldn't download this media**\n\n"
-                "The link may be private, expired, login-required, protected, or unsupported.\n\n"
-                f"Technical reason: `{str(exc)[:500]}`"
+                "The link may be private, expired, login-required, protected, or unsupported."
             )
 
 
@@ -439,3 +471,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
