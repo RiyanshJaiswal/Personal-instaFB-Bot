@@ -94,7 +94,19 @@ docker run -d --name tg-media-bot --restart unless-stopped \
   tg-media-bot
 ```
 
-Update: `git pull && docker build -t tg-media-bot . && docker rm -f tg-media-bot`, then run it again. Logs: `docker logs -f tg-media-bot`.
+Update the container after pulling changes. Reuse the same environment variables and cookie mount from the initial `docker run` command:
+
+```bash
+git pull
+docker build -t tg-media-bot .
+docker rm -f tg-media-bot
+docker run -d --name tg-media-bot --restart unless-stopped \
+  -e BOT_TOKEN="YOUR_TOKEN" \
+  -e ALLOWED_USER_IDS="123456789" \
+  tg-media-bot
+```
+
+If you use cookies, include the same `COOKIES_FILE` and read-only volume mount shown above. Logs: `docker logs -f tg-media-bot`.
 
 The Docker image installs Python 3.13, FFmpeg, N_m3u8DL-RE v0.6.0-beta (Linux x64) and the Python dependencies. If your Oracle VM is ARM (Ampere A1), the x64 N_m3u8DL-RE binary will not run; use an AMD (x86) VM shape or install the arm64 build.
 
