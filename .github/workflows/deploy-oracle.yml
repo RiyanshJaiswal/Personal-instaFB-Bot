@@ -83,61 +83,31 @@ jobs:
             "$ORACLE_USER@$ORACLE_HOST" 'bash -s' <<'REMOTE'
           set -euo pipefail
 
-          APP_DIR="$HOME/Personal-instaFB-Bot"
-          CONTAINER="tg-media-bot"
-          IMAGE="tg-media-bot:latest"
+          APP_DIR="$HOME/bot"
           ENV_FILE="$APP_DIR/.env"
 
           if [ ! -d "$APP_DIR/.git" ]; then
-            echo "Repository not found at $APP_DIR. Clone it and create its .env file before first deployment." >&2
+            echo "Repository not found at $APP_DIR." >&2
             exit 1
           fi
           if [ ! -f "$ENV_FILE" ]; then
-            echo "Missing $ENV_FILE. Create it with BOT_TOKEN and ALLOWED_USER_IDS before deployment." >&2
+            echo "Missing $ENV_FILE." >&2
             exit 1
           fi
-
           grep -qE '^BOT_TOKEN=.+$' "$ENV_FILE" || {
             echo "BOT_TOKEN is missing from $ENV_FILE." >&2
             exit 1
           }
 
-          cd "$APP_DIR"
-          git fetch --prune origin main
-          git checkout -B main origin/main
-
-          # Build first so a failed build never stops the currently running bot.
-          docker build --pull -t "$IMAGE" .
-
-          # Retain the existing optional cookies-file mount when configured.
-          RUN_ARGS=(--detach --name "$CONTAINER" --restart unless-stopped --env-file "$ENV_FILE")
-          if grep -qE '^COOKIES_FILE=/[^[:space:]]+$' "$ENV_FILE"; then
-            COOKIE_PATH="$(sed -n 's/^COOKIES_FILE=//p' "$ENV_FILE" | tail -n 1)"
-            if [ -f "$COOKIE_PATH" ]; then
-              RUN_ARGS+=(--volume "$COOKIE_PATH:$COOKIE_PATH:ro")
-            else
-              echo "COOKIES_FILE points to a missing host file; refusing to deploy." >&2
-              exit 1
-            fi
-          fi
-
-          OLD_ID="$(docker ps -aq --filter "name=^/$CONTAINER$")"
-          if [ -n "$OLD_ID" ]; then
-            docker rm -f "$CONTAINER"
-          fi
-
-          if ! docker run "${RUN_ARGS[@]}" "$IMAGE"; then
-            echo "New container failed to start." >&2
+          # Use the VM's established updater so deployment keeps its image name,
+          # container name, environment file, and cookie mount in sync.
+          cd "$HOME"
+          ./update.sh bot
+          if [ "$(sudo docker inspect -f '{{.State.Running}}' tgbot)" != "true" ]; then
+            echo "Container tgbot is not running after update." >&2
+            sudo docker logs --tail 80 tgbot >&2 || true
             exit 1
           fi
-
-          sleep 5
-          if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER")" != "true" ]; then
-            echo "Container is not running. Recent logs:" >&2
-            docker logs --tail 80 "$CONTAINER" >&2 || true
-            exit 1
-          fi
-
-          echo "Deployment successful: $CONTAINER"
-          docker ps --filter "name=^/$CONTAINER$" --format 'table {{.Names}}\t{{.Status}}'
+          echo "Deployment successful: tgbot"
+          sudo docker ps --filter "name=^/tgbot$" --format 'table {{.Names}}\t{{.Status}}'
           REMOTE
