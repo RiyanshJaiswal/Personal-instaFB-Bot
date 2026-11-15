@@ -90,7 +90,7 @@ docker run -d --name tg-media-bot --restart unless-stopped \
   -e BOT_TOKEN="YOUR_TOKEN" \
   -e ALLOWED_USER_IDS="123456789" \
   -e COOKIES_FILE=/data/cookies.txt \
-  -v /home/ubuntu/cookies.txt:/data/cookies.txt:ro \
+  -v /home/ubuntu/cookies.txt:/data/cookies.txt \
   tg-media-bot
 ```
 
