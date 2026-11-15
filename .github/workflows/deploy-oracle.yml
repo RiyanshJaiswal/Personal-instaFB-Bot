@@ -1,0 +1,143 @@
+name: Deploy to Oracle VM
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: personal-instafb-oracle-deploy
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate bot and Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Compile Python files
+        run: python -m compileall -q .
+
+      - name: Build Docker image
+        run: docker build --pull -t personal-instafb-bot:ci .
+
+  deploy:
+    name: Deploy Personal Instagram/Facebook bot
+    needs: validate
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Deploy container on Oracle VM
+        env:
+          ORACLE_HOST: ${{ secrets.ORACLE_HOST }}
+          ORACLE_USER: ${{ secrets.ORACLE_USER }}
+          ORACLE_SSH_PORT: ${{ secrets.ORACLE_SSH_PORT }}
+          ORACLE_SSH_PRIVATE_KEY: ${{ secrets.ORACLE_SSH_PRIVATE_KEY }}
+          ORACLE_SSH_KNOWN_HOSTS: ${{ secrets.ORACLE_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          : "${ORACLE_HOST:?Missing ORACLE_HOST secret}"
+          : "${ORACLE_USER:?Missing ORACLE_USER secret}"
+          : "${ORACLE_SSH_PRIVATE_KEY:?Missing ORACLE_SSH_PRIVATE_KEY secret}"
+          : "${ORACLE_SSH_KNOWN_HOSTS:?Missing ORACLE_SSH_KNOWN_HOSTS secret}"
+
+          ORACLE_HOST="$(printf '%s' "$ORACLE_HOST" | tr -d '[:space:]')"
+          PORT="${ORACLE_SSH_PORT:-22}"
+
+          python - "$ORACLE_HOST" <<'PY'
+          import ipaddress
+          import sys
+          ipaddress.ip_address(sys.argv[1])
+          print("Validated Oracle host IP.")
+          PY
+
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$ORACLE_SSH_PRIVATE_KEY" > ~/.ssh/oracle_deploy
+          chmod 600 ~/.ssh/oracle_deploy
+          printf '%s\n' "$ORACLE_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+          ssh -i ~/.ssh/oracle_deploy \
+            -p "$PORT" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "$ORACLE_USER@$ORACLE_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+
+          APP_DIR="$HOME/Personal-instaFB-Bot"
+          CONTAINER="tg-media-bot"
+          IMAGE="tg-media-bot:latest"
+          ENV_FILE="$APP_DIR/.env"
+
+          if [ ! -d "$APP_DIR/.git" ]; then
+            echo "Repository not found at $APP_DIR. Clone it and create its .env file before first deployment." >&2
+            exit 1
+          fi
+          if [ ! -f "$ENV_FILE" ]; then
+            echo "Missing $ENV_FILE. Create it with BOT_TOKEN and ALLOWED_USER_IDS before deployment." >&2
+            exit 1
+          fi
+
+          grep -qE '^BOT_TOKEN=.+$' "$ENV_FILE" || {
+            echo "BOT_TOKEN is missing from $ENV_FILE." >&2
+            exit 1
+          }
+
+          cd "$APP_DIR"
+          git fetch --prune origin main
+          git checkout -B main origin/main
+
+          # Build first so a failed build never stops the currently running bot.
+          docker build --pull -t "$IMAGE" .
+
+          # Retain the existing optional cookies-file mount when configured.
+          RUN_ARGS=(--detach --name "$CONTAINER" --restart unless-stopped --env-file "$ENV_FILE")
+          if grep -qE '^COOKIES_FILE=/[^[:space:]]+$' "$ENV_FILE"; then
+            COOKIE_PATH="$(sed -n 's/^COOKIES_FILE=//p' "$ENV_FILE" | tail -n 1)"
+            if [ -f "$COOKIE_PATH" ]; then
+              RUN_ARGS+=(--volume "$COOKIE_PATH:$COOKIE_PATH:ro")
+            else
+              echo "COOKIES_FILE points to a missing host file; refusing to deploy." >&2
+              exit 1
+            fi
+          fi
+
+          OLD_ID="$(docker ps -aq --filter "name=^/$CONTAINER$")"
+          if [ -n "$OLD_ID" ]; then
+            docker rm -f "$CONTAINER"
+          fi
+
+          if ! docker run "${RUN_ARGS[@]}" "$IMAGE"; then
+            echo "New container failed to start." >&2
+            exit 1
+          fi
+
+          sleep 5
+          if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER")" != "true" ]; then
+            echo "Container is not running. Recent logs:" >&2
+            docker logs --tail 80 "$CONTAINER" >&2 || true
+            exit 1
+          fi
+
+          echo "Deployment successful: $CONTAINER"
+          docker ps --filter "name=^/$CONTAINER$" --format 'table {{.Names}}\t{{.Status}}'
+          REMOTE
