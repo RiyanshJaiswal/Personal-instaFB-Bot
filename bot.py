@@ -159,7 +159,7 @@ def clean_caption(value: str | None, fallback: str = "") -> str:
 
 def filename_caption(path: str) -> str:
     name = Path(path).stem
-    name = re.sub(r"_ios$", "", name, flags=re.I)
+    name = re.sub(r"_(ios|tg)$", "", name, flags=re.I)
     name = re.sub(r"^[0-9a-f]{32}_", "", name, flags=re.I)
     name = re.sub(r"\s+", " ", name).strip(" _.-")
     return name[:1024] or ("Image" if is_image(path) else "Video")
@@ -183,13 +183,19 @@ def run_process(command: list[str], timeout: int = DOWNLOAD_TIMEOUT) -> subproce
 def download_with_yt_dlp(url: str, headers: dict[str, str], out_dir: str) -> tuple[list[str], str]:
     output = os.path.join(out_dir, f"{uuid.uuid4().hex}_%(title).120s.%(ext)s")
     opts = {
-        "outtmpl": output, "format": "bestvideo*+bestaudio/best", "merge_output_format": "mp4",
+        "outtmpl": output,
+        # Prefer H.264 + AAC (plays on every Telegram client and needs no re-encode), capped at 1080p.
+        # VP9/AV1/HEVC are only used when nothing else exists; those get transcoded afterwards.
+        "format": "bv*+ba/b",
+        "format_sort": ["vcodec:h264", "res:1080", "acodec:aac", "ext:mp4:m4a"],
+        "merge_output_format": "mp4",
         # Instagram carousels are playlists in yt-dlp, so cap the item count instead of disabling playlists.
         "noplaylist": False, "playlistend": MAX_PLAYLIST_ITEMS,
         "max_filesize": MAX_FILE_SIZE_MB * 1024 * 1024,
-        "quiet": True, "no_warnings": True, "retries": 3,
-        "fragment_retries": 5, "concurrent_fragment_downloads": 4,
-        "http_headers": headers, "socket_timeout": 30,
+        "quiet": True, "no_warnings": True, "noprogress": True,
+        "retries": 2, "extractor_retries": 1, "fragment_retries": 3,
+        "concurrent_fragment_downloads": 8,
+        "http_headers": headers, "socket_timeout": 20,
     }
     if COOKIES_PATH:
         opts["cookiefile"] = COOKIES_PATH
@@ -390,6 +396,8 @@ async def process_url(url: str, headers: dict[str, str], work_dir: str) -> tuple
             return await asyncio.to_thread(download_with_gallery_dl, url, work_dir)
         except Exception as exc:
             logger.warning("gallery-dl image fallback failed: %s", exc)
+        # Streamlink has no plugin for these sites, so don't spend more time on it.
+        raise UserError("Instagram/Facebook returned no media. The post may be private or deleted, or your cookies may have expired.")
 
     try:
         return await asyncio.to_thread(download_with_streamlink, url, headers, work_dir)
@@ -398,53 +406,107 @@ async def process_url(url: str, headers: dict[str, str], work_dir: str) -> tuple
         raise UserError("All available download engines failed.") from exc
 
 
-def needs_transcode(path: str) -> bool:
-    """True unless the file is already H.264 (yuv420p) with AAC-only audio, which Telegram/iOS play natively."""
+H264_OK_PROFILES = {"Baseline", "Constrained Baseline", "Main", "High"}
+AAC_ARGS = ["-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2"]
+
+
+def probe_video(path: str) -> dict | None:
+    """Playback facts about a video file, or None if ffprobe is unavailable or fails."""
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
-        return True
+        return None
     try:
-        result = run_process([ffprobe, "-v", "error", "-show_entries", "stream=codec_type,codec_name,pix_fmt", "-of", "json", path], timeout=60)
+        result = run_process(
+            [ffprobe, "-v", "error", "-show_entries",
+             "stream=codec_type,codec_name,profile,level,pix_fmt,width,height:format=duration",
+             "-of", "json", path],
+            timeout=60,
+        )
         if result.returncode != 0:
-            return True
-        streams = json.loads(result.stdout).get("streams", [])
-    except (ValueError, subprocess.TimeoutExpired):
-        return True
-    video = [s for s in streams if s.get("codec_type") == "video"]
-    audio = [s for s in streams if s.get("codec_type") == "audio"]
-    video_ok = bool(video) and video[0].get("codec_name") == "h264" and video[0].get("pix_fmt") == "yuv420p"
-    audio_ok = all(s.get("codec_name") == "aac" for s in audio)
-    return not (video_ok and audio_ok)
-
-
-def ensure_telegram_compatible(path: str) -> str:
-    if not is_video(path) or Path(path).suffix.lower() != ".mp4":
-        return path
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg or not needs_transcode(path):
-        return path
-    output = os.path.join(os.path.dirname(path), f"{Path(path).stem}_ios.mp4")
-    vf = "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p"
-    command = [ffmpeg, "-y", "-i", path, "-map", "0:v:0", "-map", "0:a:0?", "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-profile:v", "main", "-level:v", "4.0", "-pix_fmt", "yuv420p", "-tag:v", "avc1", "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "128k", "-ar", "48000", "-ac", "2", "-map_metadata", "-1", "-movflags", "+faststart", output]
-    result = run_process(command, timeout=DOWNLOAD_TIMEOUT)
-    if result.returncode != 0 or not os.path.isfile(output) or os.path.getsize(output) == 0:
-        logger.error("MP4 conversion failed: %s", result.stderr[-3000:])
-        return path
+            return None
+        data = json.loads(result.stdout)
+    except (ValueError, subprocess.TimeoutExpired, OSError):
+        return None
+    streams = data.get("streams", [])
+    video = [x for x in streams if x.get("codec_type") == "video"]
+    audio = [x for x in streams if x.get("codec_type") == "audio"]
+    if not video:
+        return None
+    v = video[0]
+    width, height = int(v.get("width") or 0), int(v.get("height") or 0)
+    level = v.get("level")
+    video_ok = (
+        v.get("codec_name") == "h264"
+        and v.get("pix_fmt") == "yuv420p"
+        and v.get("profile") in H264_OK_PROFILES
+        and (not isinstance(level, int) or level <= 42)
+        and 0 < max(width, height) <= 1920
+        and 0 < min(width, height) <= 1080
+    )
+    audio_ok = all(x.get("codec_name") == "aac" for x in audio)
     try:
-        os.remove(path)
-    except OSError:
-        pass
-    return output
+        duration = int(float(data.get("format", {}).get("duration") or 0))
+    except (TypeError, ValueError):
+        duration = 0
+    return {"video_ok": video_ok, "audio_ok": audio_ok, "width": width, "height": height, "duration": duration}
+
+
+def _telegram_meta(info: dict | None) -> dict:
+    if info and info.get("width") and info.get("height"):
+        return {"width": info["width"], "height": info["height"], "duration": info.get("duration", 0)}
+    return {}
+
+
+def ensure_telegram_compatible(path: str) -> tuple[str, dict]:
+    """Make a video play everywhere: H.264 + AAC in an MP4 with faststart.
+
+    Handles ANY container (webm/mkv/mov/...), not just .mp4. Players that can't decode the video codec
+    (VP9/AV1/HEVC/10-bit/4K) show audio only, so those streams must be re-encoded.
+    Returns (path, metadata for Telegram).
+    """
+    if not is_video(path):
+        return path, {}
+    info = probe_video(path)
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return path, _telegram_meta(info)
+
+    output = os.path.join(os.path.dirname(path), f"{Path(path).stem}_tg.mp4")
+    scale = "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p"
+    full = ["-vf", scale, "-c:v", "libx264", "-preset", "superfast", "-crf", "24", "-profile:v", "high",
+            "-level:v", "4.2", "-pix_fmt", "yuv420p", "-tag:v", "avc1",
+            *(["-c:a", "copy"] if info and info["audio_ok"] else AAC_ARGS)]
+    if info and info["video_ok"] and info["audio_ok"]:
+        attempts = [("remux", ["-c", "copy"]), ("transcode", full)]          # already compatible: just fix container
+    elif info and info["video_ok"]:
+        attempts = [("audio-transcode", ["-c:v", "copy", *AAC_ARGS]), ("transcode", full)]  # copy video, fix audio only
+    else:
+        attempts = [("transcode", full)]                                      # video codec/size not playable everywhere
+
+    for mode, codec_args in attempts:
+        started = time.perf_counter()
+        command = [ffmpeg, "-y", "-i", path, "-map", "0:v:0", "-map", "0:a:0?", *codec_args,
+                   "-map_metadata", "-1", "-movflags", "+faststart", output]
+        result = run_process(command, timeout=DOWNLOAD_TIMEOUT)
+        if result.returncode == 0 and os.path.isfile(output) and os.path.getsize(output) > 0:
+            logger.info("ffmpeg %s took %.1fs for %s", mode, time.perf_counter() - started, Path(path).name)
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return output, _telegram_meta(probe_video(output) or info)
+        logger.error("ffmpeg %s failed: %s", mode, result.stderr[-1500:])
+    return path, _telegram_meta(info)
 
 
 async def send_single(update: Update, path: str, caption: str) -> None:
     if is_video(path):
-        path = await asyncio.to_thread(ensure_telegram_compatible, path)
+        path, meta = await asyncio.to_thread(ensure_telegram_compatible, path)
         if is_too_large(path):
             raise UserError(f"Video is larger than Telegram's bot upload limit ({MAX_FILE_SIZE_MB} MB).")
         with open(path, "rb") as media:
             try:
-                await update.message.reply_video(video=media, caption=caption, supports_streaming=True)
+                await update.message.reply_video(video=media, caption=caption, supports_streaming=True, **meta)
             except Exception as exc:
                 logger.warning("Telegram video upload failed, falling back to document: %s", exc)
                 media.seek(0)
@@ -521,7 +583,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     async with _job_slots:
         with tempfile.TemporaryDirectory(prefix="tgdl_") as work_dir:
             try:
+                t_fetch = time.perf_counter()
                 files, caption = await process_url(url, headers, work_dir)
+                t_fetch = time.perf_counter() - t_fetch
+                t_send = time.perf_counter()
                 existing = [f for f in files if os.path.isfile(f)]
                 files = [f for f in existing if not is_too_large(f)]
                 if not files:
@@ -538,6 +603,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     for path in files[:20]:
                         await send_single(update, path, caption)
                 await status.delete()
+                logger.info("Done %s | fetch=%.1fs prepare+send=%.1fs", urlparse(url).hostname, t_fetch, time.perf_counter() - t_send)
             except Exception as exc:
                 logger.exception("Download failed for %s", url)
                 reason = str(exc)[:300] if isinstance(exc, UserError) else "see the server logs for details"
