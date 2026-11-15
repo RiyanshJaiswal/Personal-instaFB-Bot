@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg curl ca-certificates tar \
+    && apt-get install -y --no-install-recommends ffmpeg curl ca-certificates tar git \
     && rm -rf /var/lib/apt/lists/*
 
 # N_m3u8DL-RE v0.6.0-beta: current Linux x64 static build.
