@@ -383,6 +383,7 @@ def ensure_telegram_compatible(path: str) -> str:
         and info.get("acodec") in (None, "aac") and "mp4" in info.get("container", "")
         and Path(path).suffix.lower() in {".mp4", ".m4v", ".mov"}
         and (info.get("width") or 0) <= 1920 and (info.get("height") or 0) <= 1920
+        and not is_too_large(path)
     )
     output = os.path.join(os.path.dirname(path), f"{Path(path).stem}_tg.mp4")
     if already_ok:
