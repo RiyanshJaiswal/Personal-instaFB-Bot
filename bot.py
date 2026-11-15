@@ -29,6 +29,9 @@ except ImportError:
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+# httpx logs full request URLs at INFO level, and Telegram's API URL contains the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 class UserError(RuntimeError):
