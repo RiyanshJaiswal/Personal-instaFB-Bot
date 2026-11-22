@@ -69,6 +69,7 @@ class Post:
     code: str
     files: list = field(default_factory=list)  # [(video_url | None, image_url | None)]
     description: str = ""
+    single_media: bool = True
 
     @property
     def kind(self) -> str:
@@ -113,7 +114,7 @@ def parse_line(line: str) -> dict | None:
     except ValueError:
         name = ""
     return {
-        "code": code, "video_url": _none(vurl), "image_url": _none(iurl),
+        "code": code, "index": _num, "video_url": _none(vurl), "image_url": _none(iurl),
         "total": int(total) if total.isdigit() else None,
         "username": _none(username), "fullname": name if isinstance(name, str) else "",
         "description": description if isinstance(description, str) else "",
@@ -121,7 +122,7 @@ def parse_line(line: str) -> dict | None:
 
 
 def summarize(posts: list) -> dict:
-    videos = [p for p in posts if p.kind == "video"]
+    videos = [p for p in posts if p.kind in ("video", "mixed")]
     images = [p for p in posts if p.kind in ("image", "mixed")]
     return {
         "videos": len(videos), "images": len(images),
@@ -131,12 +132,13 @@ def summarize(posts: list) -> dict:
 
 
 def select_posts(posts: list, kind: str, amount: int | None) -> list:
-    if kind == "video":
-        pool = [p for p in posts if p.kind == "video"]
-    elif kind == "image":
-        pool = [p for p in posts if p.kind in ("image", "mixed")]
-    else:
-        pool = list(posts)
+    pool = []
+    for post in posts:
+        if kind == "both" or post.kind == kind:
+            pool.append(post)
+        elif post.kind == "mixed":
+            files = [(v, i) for v, i in post.files if bool(v) == (kind == "video")]
+            pool.append(Post(post.code, files, post.description, single_media=False))
     return pool if amount is None else pool[:amount]
 
 
@@ -176,7 +178,7 @@ def kb_kind(sid: str, stats: dict) -> InlineKeyboardMarkup:
     if stats["images"]:
         rows.append([_btn(f"🖼 Images ({stats['images']})", f"pf:{sid}:k:image")])
     if stats["videos"] and stats["images"]:
-        rows.append([_btn(f"📦 Dono ({stats['videos'] + stats['images']})", f"pf:{sid}:k:both")])
+        rows.append([_btn(f"📦 Dono ({stats['videos'] + stats['images'] - stats['mixed']})", f"pf:{sid}:k:both")])
     rows.append([_btn("❌ Cancel", f"pf:{sid}:x")])
     return InlineKeyboardMarkup(rows)
 
@@ -223,10 +225,11 @@ async def scan_profile(session: dict, status_msg) -> tuple[list, dict]:
         raise ScanError("gallery-dl server pe install nahi hai.")
     username = session["username"]
     cmd = [
-        binary, "--cookies", bot.COOKIES_PATH,
+        binary, *(["--cookies", bot.COOKIES_PATH] if bot.COOKIES_PATH else []),
         "-o", f"max-posts={SCAN_LIMIT}", "-o", f"sleep-request={SCAN_SLEEP}",
         "-o", "sleep-429=30", "-o", "retries=2",
         "-N", PRINT_FORMAT, f"https://www.instagram.com/{username}/posts/",
+        f"https://www.instagram.com/{username}/reels/",
     ]
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, limit=1 << 20,
@@ -251,7 +254,8 @@ async def scan_profile(session: dict, status_msg) -> tuple[list, dict]:
     pumps = [asyncio.create_task(pump_out()), asyncio.create_task(pump_err())]
     posts: list[Post] = []
     info = {"total": None, "username": username, "fullname": "", "partial": False}
-    current: Post | None = None
+    by_code: dict[str, Post] = {}
+    seen_media: set[tuple[str, str]] = set()
     started = last_edit = time.monotonic()
 
     async def progress():
@@ -287,17 +291,23 @@ async def scan_profile(session: dict, status_msg) -> tuple[list, dict]:
                 info["total"] = row["total"]
             if row["fullname"] and not info["fullname"]:
                 info["fullname"] = row["fullname"]
-            if current is None or current.code != row["code"]:
-                current = Post(code=row["code"], description=row["description"])
-                posts.append(current)
-            current.files.append((row["video_url"], row["image_url"]))
+            key = (row["code"], row["index"])
+            if key in seen_media:
+                continue
+            seen_media.add(key)
+            if row["code"] not in by_code:
+                post = Post(code=row["code"], description=row["description"])
+                posts.append(post)
+                by_code[post.code] = post
+            by_code[row["code"]].files.append((row["video_url"], row["image_url"]))
             await progress()
     finally:
-        if proc.returncode is None:
+        if proc.returncode is None and (session["stop"] or info["partial"] or not proc.stdout.at_eof()):
             proc.kill()
         await proc.wait()
         for task in pumps:
             task.cancel()
+        await asyncio.gather(*pumps, return_exceptions=True)
 
     tail = "\n".join(stderr_tail)
     if proc.returncode not in (0, None) and not info["partial"]:
@@ -308,6 +318,11 @@ async def scan_profile(session: dict, status_msg) -> tuple[list, dict]:
     if not posts:
         logger.warning("gallery-dl returned no posts for @%s: %s", username, tail[-1500:])
         raise ScanError("Is profile me koi post nahi mili (ya account private hai).")
+    if SCAN_LIMIT > 0 and len(posts) >= SCAN_LIMIT:
+        info["partial"] = True
+    # Shortcodes encode monotonically increasing Instagram media IDs in base64.
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    posts.sort(key=lambda post: (len(post.code), [alphabet.find(c) for c in post.code]), reverse=True)
     return posts, info
 
 
@@ -321,16 +336,18 @@ def summary_text(session: dict) -> str:
     note = ""
     if info.get("total") and scanned < info["total"]:
         note = " (latest posts, baaki skip)" if scanned >= SCAN_LIMIT else " (kuch posts available nahi the)"
+    if not info.get("total") and not info.get("partial"):
+        lines.append(f"📌 Total posts mile: {scanned}")
     lines.append(f"🔎 Scan hui: {scanned} posts{note}")
     if info.get("partial"):
-        lines.append("⚠️ Scan beech me ruk gaya (rate-limit/timeout), jitna mila utna dikha raha hu.")
+        lines.append("⚠️ Scan limited ho sakta hai (limit, timeout ya Instagram error). Counts aur Saari sirf scanned posts ke liye hain.")
     lines += [
         "",
         f"🎬 Reels/Videos: {stats['videos']}",
         f"🖼 Image posts: {stats['images']}" + (f" (carousel: {stats['carousels']})" if stats["carousels"] else ""),
     ]
     if stats["mixed"]:
-        lines.append(f"ℹ️ {stats['mixed']} carousel me photo + video dono hain (Images me ginti hui).")
+        lines.append(f"ℹ️ {stats['mixed']} carousel me photo + video dono hain (dono categories me gine; sirf chuna hua media bhejunga).")
     lines += ["", "Kya download karna hai?"]
     return "\n".join(lines)
 
@@ -339,7 +356,7 @@ def summary_text(session: dict) -> str:
 
 async def fetch_post(post: Post, workdir: str) -> list[str]:
     headers = {"User-Agent": bot.DEFAULT_USER_AGENT}
-    if post.kind == "video" and len(post.files) == 1:
+    if post.single_media and post.kind == "video" and len(post.files) == 1:
         try:  # proven path: yt-dlp merges audio+video correctly
             files, _ = await asyncio.to_thread(bot.download_with_yt_dlp, post.link, headers, workdir)
             files = [f for f in files if os.path.isfile(f)]
@@ -454,17 +471,18 @@ async def start_job(context: ContextTypes.DEFAULT_TYPE, session: dict, amount: i
 
 async def begin_scan(update: Update, context: ContextTypes.DEFAULT_TYPE, username: str) -> None:
     msg, uid = update.message, update.effective_user.id
-    if not bot.COOKIES_PATH:
-        await msg.reply_text("Profile scan ke liye Instagram cookies zaroori hain (server pe cookies=NO hai).")
-        return
     if _active["uid"] is not None:
         await msg.reply_text("Abhi ek profile scan/download chal raha hai. Thodi der baad dobara bhejo.")
         return
     _active["uid"] = uid
     sid = secrets.token_hex(3)
-    status = await msg.reply_text(
-        f"🔍 @{username} check ho raha hai...\n(Posts ginne me kuch minute lag sakte hain)", reply_markup=kb_stop(sid),
-    )
+    try:
+        status = await msg.reply_text(
+            f"🔍 @{username} check ho raha hai...\n(Posts ginne me kuch minute lag sakte hain)", reply_markup=kb_stop(sid),
+        )
+    except BaseException:
+        _active["uid"] = None
+        raise
     session = {"sid": sid, "uid": uid, "username": username, "status": status, "origin": msg, "state": "scanning",
                "stop": False, "posts": [], "info": {}, "kind": None, "touched": time.time()}
     context.user_data["pf"] = session
@@ -568,3 +586,4 @@ def register(app, bot_module) -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text), group=-1)
     app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^pf:"))
     app.add_handler(CommandHandler("stop", on_stop_command))
+
