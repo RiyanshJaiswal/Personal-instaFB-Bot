@@ -11,6 +11,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -50,6 +51,7 @@ AUDIO_EXTENSIONS = {".m4a", ".mp3", ".aac", ".flac"}
 MEDIA_EXTENSIONS = VIDEO_EXTENSIONS | IMAGE_EXTENSIONS | AUDIO_EXTENSIONS
 DIRECT_EXTENSIONS = MEDIA_EXTENSIONS
 _last_request: dict[int, float] = {}
+_job_slots = asyncio.Semaphore(1)  # serialize profile bulk-download jobs
 
 
 def prepare_cookies_file() -> str | None:
@@ -74,6 +76,11 @@ def prepare_cookies_file() -> str | None:
         return None
 
 COOKIES_PATH = prepare_cookies_file()
+
+
+def is_allowed(user_id: int) -> bool:
+    """Preserve the existing ALLOWED_USER_IDS policy (empty means open access)."""
+    return not ALLOWED_USER_IDS or user_id in ALLOWED_USER_IDS
 
 
 def parse_request(text: str) -> tuple[str | None, dict[str, str]]:
@@ -508,9 +515,16 @@ def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is not set")
     logger.info("Starting bot | cookies=%s | gallery-dl=%s | N_m3u8DL-RE=%s | ffmpeg=%s | streamlink=%s", "YES" if COOKIES_PATH else "NO", "YES" if shutil.which("gallery-dl") else "NO", "YES" if shutil.which("N_m3u8DL-RE") else "NO", "YES" if shutil.which("ffmpeg") else "NO", "YES" if streamlink else "NO")
-    app = Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(120).write_timeout(120).pool_timeout(30).build()
+    app = (
+        Application.builder().token(BOT_TOKEN)
+        .concurrent_updates(True)
+        .connect_timeout(30).read_timeout(120).write_timeout(120).pool_timeout(30)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    import profile_feature  # Instagram profile scan + bulk download
+    profile_feature.register(app, sys.modules[__name__])
     app.run_polling(drop_pending_updates=True)
 
 
