@@ -23,6 +23,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from types import SimpleNamespace
+from urllib.parse import urlparse
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, RetryAfter
@@ -45,11 +46,7 @@ RESERVED = {
     "developer", "directory", "web", "challenge", "oauth", "emails", "locations", "api", "static", "privacy",
     "terms", "ar", "download",
 }
-PROFILE_RE = re.compile(
-    r"^https?://(?:www\.|m\.)?instagram\.com/(?:_u/)?(?P<user>[A-Za-z0-9._]{1,30})/?"
-    r"(?:(?:posts|reels|tagged)/?)?(?:\?\S*)?(?:#\S*)?$",
-    re.I,
-)
+USERNAME_RE = re.compile(r"[A-Za-z0-9._]{1,30}")
 
 # One line per media file: shortcode, index in post, video url, image url, total posts, username, name(json), caption(json)
 PRINT_FORMAT = "\t".join([
@@ -87,13 +84,22 @@ class Post:
 
 def extract_username(text: str) -> str | None:
     """Return the username if the whole message is just an Instagram profile link."""
-    parts = text.strip().split()
+    cleaned = text.strip().translate(dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff")))
+    parts = cleaned.split()
     if len(parts) != 1:
         return None
-    m = PROFILE_RE.match(parts[0])
-    if not m or m.group("user").lower() in RESERVED:
+    parsed = urlparse(parts[0])
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in {"http", "https"} or host not in {"instagram.com", "www.instagram.com", "m.instagram.com"}:
         return None
-    return m.group("user")
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    if segments[:1] == ["_u"]:
+        segments = segments[1:]
+    if len(segments) == 2 and segments[1].lower() in {"posts", "reels", "tagged"}:
+        segments = segments[:1]
+    if len(segments) != 1 or not USERNAME_RE.fullmatch(segments[0]) or segments[0].lower() in RESERVED:
+        return None
+    return segments[0]
 
 
 def _none(value: str) -> str | None:

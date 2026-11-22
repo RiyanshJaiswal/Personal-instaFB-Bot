@@ -74,6 +74,20 @@ class ProfileConversation(unittest.IsolatedAsyncioTestCase):
             pass
         self.assertIsNone(pf._active["uid"])
 
+    async def test_profile_url_cannot_fall_through_to_single_media_handler(self):
+        self.message.text = "https://www.instagram.com/luckyrajor_/"
+        with patch.object(pf, "begin_scan", AsyncMock()) as begin_scan, \
+                patch.object(bot, "deliver_media", AsyncMock()) as deliver_media:
+            await bot.handle_message(self.update, self.context)
+        begin_scan.assert_awaited_once_with(self.update, self.context, "luckyrajor_")
+        deliver_media.assert_not_awaited()
+
+    def test_profile_url_normalizes_telegram_invisible_characters(self):
+        self.assertEqual(
+            pf.extract_username("\u200bhttps://www.instagram.com/luckyrajor_/?igsh=abc\ufeff"),
+            "luckyrajor_",
+        )
+
 
 class Delivery(unittest.IsolatedAsyncioTestCase):
     async def test_album_with_singleton_tail(self):

@@ -485,6 +485,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not is_allowed(user_id):
         await update.message.reply_text("⛔ You are not authorized to use this bot.")
         return
+    import profile_feature
+    username = profile_feature.extract_username(update.message.text)
+    if username:
+        await profile_feature.begin_scan(update, context, username)
+        return
     now = time.time()
     wait_left = COOLDOWN_SECONDS - (now - _last_request.get(user_id, 0))
     if wait_left > 0:
