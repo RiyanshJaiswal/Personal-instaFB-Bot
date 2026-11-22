@@ -23,7 +23,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
-COPY bot.py .
+COPY bot.py profile_feature.py ./
 
 # Run as non-root; UID 1001 matches ubuntu on the target Oracle VM and its mounted cookies file.
 RUN useradd -m --uid 1001 botuser
