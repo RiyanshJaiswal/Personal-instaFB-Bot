@@ -33,6 +33,7 @@ jobs:
       - name: Import and feature smoke tests
         run: |
           python - <<'PY'
+          import json
           import bot
           import profile_feature as pf
 
@@ -40,7 +41,10 @@ jobs:
           assert pf.extract_username("https://www.instagram.com/example/") == "example"
           assert pf.extract_username("https://www.instagram.com/reel/ABC123/") is None
 
-          row = "ABC123\\t1\\tNone\\thttps://cdn.example/image.jpg\\t12\\texample\\t\\"Example User\\"\\t\\"caption\\""
+          row = "\t".join([
+              "ABC123", "1", "None", "https://cdn.example/image.jpg", "12",
+              "example", json.dumps("Example User"), json.dumps("caption"),
+          ])
           parsed = pf.parse_line(row)
           assert parsed is not None
           assert parsed["code"] == "ABC123"
