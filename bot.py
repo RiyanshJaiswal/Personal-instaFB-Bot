@@ -11,6 +11,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -555,7 +556,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📥 **Instagram, Facebook & Threads Downloader**\n\n"
         "🔗 Bas Reel, Video, Story, Post ya Threads link yahan paste karo.\n"
         "⚡️ Main media process karke directly yahin send kar dunga.\n\n"
-        "**No extra steps. Just paste the link! 🚀**",
+        "**No extra steps. Just paste the link! 🚀**\n\n"
+        "👤 Instagram **profile link** doge to main posts ginke bata dunga (reels/videos kitni, images kitni) "
+        "aur tum chuno ki kya aur kitna download karna hai.",
         parse_mode="Markdown",
     )
 
@@ -641,6 +644,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(on_error)
+    import profile_feature  # Instagram profile scan + bulk download
+    profile_feature.register(app, sys.modules[__name__])
     app.run_polling(drop_pending_updates=True)
 
 

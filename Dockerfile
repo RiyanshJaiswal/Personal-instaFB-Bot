@@ -30,7 +30,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
-COPY bot.py .
+COPY bot.py profile_feature.py ./
 
 # Run as an unprivileged user.
 RUN useradd --create-home --uid 10001 bot && chown -R bot:bot /app
