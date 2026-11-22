@@ -2,6 +2,8 @@
 
 Send a URL to Telegram and the bot downloads the media server-side and sends it back.
 
+Send an Instagram profile link to scan its posts and reels. The summary counts unique posts and reports the scanned video and image categories. A mixed carousel counts in both categories. Choose videos, images, or both, then choose all scanned matches or enter a number of posts. Selecting a single category sends only matching items from a mixed carousel. Scans can be partial when Instagram limits access or the configured scan limit or timeout is reached.
+
 ## Downloader stack
 
 The bot uses multiple engines instead of relying on one extractor:
@@ -37,7 +39,7 @@ User-Agent: Mozilla/5.0
 | Variable | Default | Purpose |
 |---|---:|---|
 | `BOT_TOKEN` | required | Telegram BotFather token |
-| `ALLOWED_USER_IDS` | empty (open to all) | Comma-separated Telegram user IDs allowed to use the bot — **set this** |
+| `ALLOWED_USER_IDS` | empty | Comma-separated positive Telegram user IDs. Required when `COOKIES_FILE` is configured. Without cookies, an empty list allows public access. |
 | `COOKIES_FILE` | empty | Netscape `cookies.txt` path or inline cookie-file content |
 | `MAX_FILE_SIZE_MB` | `50` | Maximum file sent through the normal Telegram Bot API |
 | `COOLDOWN_SECONDS` | `5` | Per-user request cooldown |
@@ -115,4 +117,5 @@ The Docker image installs Python 3.13, FFmpeg, N_m3u8DL-RE v0.6.0-beta (Linux x6
 A media URL copied from another machine may fail when replayed from this server if the provider binds the request to the original IP, cookies, Referer, or other HTTP headers. For that reason the next desktop-helper phase will send the relevant URL and request metadata from the laptop to this bot.
 
 Use this only for media you are authorized to download.
+
 

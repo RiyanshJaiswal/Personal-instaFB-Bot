@@ -57,13 +57,17 @@ jobs:
               pf.Post(code="MIXED1", files=[("https://cdn.example/video.mp4", None), (None, "https://cdn.example/image.jpg")]),
           ]
           stats = pf.summarize(posts)
-          assert stats == {"videos": 1, "images": 2, "carousels": 1, "mixed": 1}
-          assert [p.code for p in pf.select_posts(posts, "video", None)] == ["VIDEO1"]
+          assert stats == {"videos": 2, "images": 2, "carousels": 1, "mixed": 1}
+          assert [p.code for p in pf.select_posts(posts, "video", None)] == ["VIDEO1", "MIXED1"]
           assert [p.code for p in pf.select_posts(posts, "image", None)] == ["IMAGE1", "MIXED1"]
           assert [p.code for p in pf.select_posts(posts, "both", 2)] == ["VIDEO1", "IMAGE1"]
 
           print("Import, URL parsing, metadata parsing, classification and selection smoke tests passed.")
           PY
 
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
+
       - name: Build Docker image
         run: docker build --pull -t personal-instafb-bot:pr-test .
+

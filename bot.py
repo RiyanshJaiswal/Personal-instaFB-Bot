@@ -42,7 +42,14 @@ DEFAULT_USER_AGENT = os.environ.get(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
 )
-ALLOWED_USER_IDS = {int(x) for x in re.findall(r"\d+", os.environ.get("ALLOWED_USER_IDS", ""))}
+def parse_allowed_ids(value: str) -> set[int]:
+    ids = [item.strip() for item in value.split(",") if item.strip()]
+    if any(not re.fullmatch(r"[1-9][0-9]*", item) for item in ids):
+        raise ValueError("ALLOWED_USER_IDS must contain comma-separated positive Telegram IDs")
+    return {int(item) for item in ids}
+
+
+ALLOWED_USER_IDS = parse_allowed_ids(os.environ.get("ALLOWED_USER_IDS", ""))
 URL_RE = re.compile(r"^https?://\S+$", re.I)
 MANIFEST_RE = re.compile(r"\.(m3u8|m3u|mpd)(?:$|[?#])", re.I)
 VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".ts"}
@@ -63,9 +70,9 @@ def prepare_cookies_file() -> str | None:
     if not ("# Netscape HTTP Cookie File" in value or "# HTTP Cookie File" in value or ("instagram.com" in value and "\t" in value)):
         logger.warning("COOKIES_FILE is set but no valid cookies.txt content was detected")
         return None
-    path = os.path.join(tempfile.gettempdir(), "bot_cookies.txt")
     try:
-        with open(path, "w", encoding="utf-8") as fh:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="bot_cookies_", delete=False) as fh:
+            path = fh.name
             fh.write(value)
             if not value.endswith("\n"):
                 fh.write("\n")
@@ -79,8 +86,7 @@ COOKIES_PATH = prepare_cookies_file()
 
 
 def is_allowed(user_id: int) -> bool:
-    """Preserve the existing ALLOWED_USER_IDS policy (empty means open access)."""
-    return not ALLOWED_USER_IDS or user_id in ALLOWED_USER_IDS
+    return user_id in ALLOWED_USER_IDS or (not ALLOWED_USER_IDS and not COOKIES_PATH)
 
 
 def parse_request(text: str) -> tuple[str | None, dict[str, str]]:
@@ -229,34 +235,11 @@ def download_with_gallery_dl(url: str, out_dir: str) -> tuple[list[str], str]:
     return files, (extract_caption_from_json(out_dir) or filename_caption(files[0]))
 
 
-def extract_cookie_header(cookie_path: str, target_url: str) -> str:
-    host = (urlparse(target_url).hostname or "").lower()
-    pairs = []
-    try:
-        with open(cookie_path, encoding="utf-8", errors="ignore") as fh:
-            for line in fh:
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.rstrip("\n").split("\t")
-                if len(parts) >= 7:
-                    domain, _, _, _, _, name, value = parts[:7]
-                    domain = domain.lstrip(".").lower()
-                    if host == domain or host.endswith("." + domain):
-                        pairs.append(f"{name}={value}")
-    except OSError:
-        pass
-    return "; ".join(pairs)
-
-
 def download_with_n_m3u8dl(url: str, headers: dict[str, str], out_dir: str) -> tuple[list[str], str]:
     binary = shutil.which("N_m3u8DL-RE") or shutil.which("N_m3u8DL-RE.exe")
     if not binary:
         raise RuntimeError("N_m3u8DL-RE is not installed")
     command = [binary, url, "--save-dir", out_dir, "--save-name", safe_filename(filename_from_url(url)), "--del-after-done", "--no-date-info", "--no-log", "--concurrent-download", "--download-retry-count", "5", "--http-request-timeout", "60", "--ffmpeg-binary-path", shutil.which("ffmpeg") or "/usr/bin/ffmpeg"]
-    if COOKIES_PATH:
-        cookie_header = extract_cookie_header(COOKIES_PATH, url)
-        if cookie_header:
-            command += ["-H", f"Cookie: {cookie_header}"]
     for key, value in headers.items():
         command += ["-H", f"{key}: {value}"]
     result = run_process(command)
@@ -286,6 +269,10 @@ def download_with_streamlink(url: str, headers: dict[str, str], out_dir: str) ->
     return [mp4_path], "Video"
 
 
+class DownloadTooLarge(RuntimeError):
+    pass
+
+
 async def download_direct(url: str, headers: dict[str, str], out_dir: str) -> tuple[list[str], str]:
     filename = filename_from_url(url)
     if not Path(filename).suffix:
@@ -300,9 +287,22 @@ async def download_direct(url: str, headers: dict[str, str], out_dir: str) -> tu
             ext = mimetypes.guess_extension(content_type.split(";", 1)[0].strip())
             if ext in DIRECT_EXTENSIONS:
                 path = os.path.join(out_dir, safe_filename(Path(filename).stem + ext))
-            with open(path, "wb") as fh:
-                async for chunk in response.aiter_bytes(1024 * 1024):
-                    fh.write(chunk)
+            limit = MAX_FILE_SIZE_MB * 1024 * 1024
+            length = response.headers.get("content-length", "")
+            if length.isdigit() and int(length) > limit:
+                raise DownloadTooLarge("Download exceeds the configured size limit")
+            size = 0
+            partial = path + ".part"
+            try:
+                with open(partial, "wb") as fh:
+                    async for chunk in response.aiter_bytes(1024 * 1024):
+                        size += len(chunk)
+                        if size > limit:
+                            raise DownloadTooLarge("Download exceeds the configured size limit")
+                        fh.write(chunk)
+                os.replace(partial, path)
+            finally:
+                Path(partial).unlink(missing_ok=True)
     return [path], filename_caption(path)
 
 
@@ -318,18 +318,24 @@ async def process_url(url: str, headers: dict[str, str], work_dir: str) -> tuple
             files, caption = await download_direct(url, headers, work_dir)
             if files and not is_too_large(files[0]):
                 return files, caption
+        except DownloadTooLarge:
+            raise
         except Exception as exc:
-            logger.info("Direct download failed: %s", exc)
+            logger.info("Direct download failed: %s", type(exc).__name__)
 
     if manifest:
         try:
-            return await asyncio.to_thread(download_with_n_m3u8dl, url, headers, work_dir)
+            files, caption = await asyncio.to_thread(download_with_n_m3u8dl, url, headers, work_dir)
+            if files:
+                return files, caption
         except Exception as exc:
-            logger.warning("N_m3u8DL-RE failed: %s", exc)
+            logger.warning("N_m3u8DL-RE failed: %s", type(exc).__name__)
         try:
-            return await asyncio.to_thread(download_with_yt_dlp, url, headers, work_dir)
+            files, caption = await asyncio.to_thread(download_with_yt_dlp, url, headers, work_dir)
+            if files:
+                return files, caption
         except Exception as exc:
-            logger.warning("yt-dlp manifest fallback failed: %s", exc)
+            logger.warning("yt-dlp manifest fallback failed: %s", type(exc).__name__)
         return await asyncio.to_thread(download_with_streamlink, url, headers, work_dir)
 
     try:
@@ -337,19 +343,19 @@ async def process_url(url: str, headers: dict[str, str], work_dir: str) -> tuple
         if files:
             return files, caption
     except Exception as exc:
-        logger.warning("yt-dlp failed: %s", exc)
+        logger.warning("yt-dlp failed: %s", type(exc).__name__)
 
     if is_social:
         try:
             return await asyncio.to_thread(download_with_gallery_dl, url, work_dir)
         except Exception as exc:
-            logger.warning("gallery-dl image fallback failed: %s", exc)
+            logger.warning("gallery-dl image fallback failed: %s", type(exc).__name__)
             raise RuntimeError("No downloadable media was found in this social post") from exc
 
     try:
         return await asyncio.to_thread(download_with_streamlink, url, headers, work_dir)
     except Exception as exc:
-        logger.warning("Streamlink failed: %s", exc)
+        logger.warning("Streamlink failed: %s", type(exc).__name__)
         raise RuntimeError("All available download engines failed") from exc
 
 
@@ -424,7 +430,7 @@ async def send_single(update: Update, path: str, caption: str) -> None:
                 meta = await asyncio.to_thread(probe_video, path)
                 await update.message.reply_video(video=media, caption=caption, supports_streaming=True, width=meta.get("width"), height=meta.get("height"), duration=meta.get("duration"))
             except Exception as exc:
-                logger.warning("Telegram video upload failed, falling back to document: %s", exc)
+                logger.warning("Telegram video upload failed, falling back to document: %s", type(exc).__name__)
                 media.seek(0)
                 await update.message.reply_document(document=media, caption=caption)
         return
@@ -433,7 +439,7 @@ async def send_single(update: Update, path: str, caption: str) -> None:
             try:
                 await update.message.reply_photo(photo=media, caption=caption)
             except Exception as exc:
-                logger.warning("Telegram photo upload failed, falling back to document: %s", exc)
+                logger.warning("Telegram photo upload failed, falling back to document: %s", type(exc).__name__)
                 media.seek(0)
                 await update.message.reply_document(document=media, caption=caption)
         return
@@ -445,6 +451,9 @@ async def send_image_album(update: Update, files: list[str], caption: str) -> No
     files = files[:20]
     for start in range(0, len(files), 10):
         chunk = files[start:start + 10]
+        if len(chunk) == 1:
+            await send_single(update, chunk[0], caption if start == 0 else "")
+            continue
         handles = []
         media_group = []
         try:
@@ -473,7 +482,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not update.message or not update.message.text:
         return
     user_id = update.effective_user.id if update.effective_user else 0
-    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+    if not is_allowed(user_id):
         await update.message.reply_text("⛔ You are not authorized to use this bot.")
         return
     now = time.time()
@@ -487,6 +496,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     _last_request[user_id] = now
     status = await update.message.reply_text("⏳ **Processing your media...**", parse_mode="Markdown")
+    async with _job_slots:
+        await deliver_media(update, status, url, headers)
+
+
+async def deliver_media(update: Update, status, url: str, headers: dict[str, str]) -> None:
     with tempfile.TemporaryDirectory(prefix="tgdl_") as work_dir:
         try:
             files, caption = await process_url(url, headers, work_dir)
@@ -504,7 +518,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     await send_single(update, path, caption)
             await status.delete()
         except Exception as exc:
-            logger.exception("Download failed for %s", url)
+            logger.warning("Download failed (%s)", type(exc).__name__)
             await status.edit_text(
                 "❌ **Couldn't download this media**\n\n"
                 "The link may be private, expired, login-required, protected, or unsupported."
@@ -512,6 +526,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def main() -> None:
+    if COOKIES_PATH and not ALLOWED_USER_IDS:
+        raise SystemExit("Set ALLOWED_USER_IDS before starting a bot with server cookies")
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is not set")
     logger.info("Starting bot | cookies=%s | gallery-dl=%s | N_m3u8DL-RE=%s | ffmpeg=%s | streamlink=%s", "YES" if COOKIES_PATH else "NO", "YES" if shutil.which("gallery-dl") else "NO", "YES" if shutil.which("N_m3u8DL-RE") else "NO", "YES" if shutil.which("ffmpeg") else "NO", "YES" if streamlink else "NO")
