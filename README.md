@@ -75,6 +75,12 @@ python bot.py
 
 ## Deploy on an Oracle Cloud VM (Docker)
 
+The production Oracle deployment uses the container name `igbot`. Its runtime
+configuration is stored on the VM in `~/igbot.env`, and Instagram cookies are
+mounted read-only from `~/igbot-cookies.txt`. Pushes to `main` build the exact
+Git commit, replace `igbot` with rollback protection, and verify the configured
+Telegram identity before reporting a successful deployment.
+
 ```bash
 git clone https://github.com/RiyanshJaiswal/Personal-instaFB-Bot.git
 cd Personal-instaFB-Bot

@@ -62,6 +62,14 @@ jobs:
           ORACLE_HOST="$(printf '%s' "$ORACLE_HOST" | tr -d '[:space:]')"
           PORT="${ORACLE_SSH_PORT:-22}"
 
+          case "$GITHUB_SHA" in
+            (*[!0-9a-f]*|'') echo "Invalid deployment commit SHA." >&2; exit 1 ;;
+          esac
+          [ "${#GITHUB_SHA}" -eq 40 ] || {
+            echo "Invalid deployment commit SHA length." >&2
+            exit 1
+          }
+
           python - "$ORACLE_HOST" <<'PY'
           import ipaddress
           import sys
@@ -80,11 +88,22 @@ jobs:
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
-            "$ORACLE_USER@$ORACLE_HOST" 'bash -s' <<'REMOTE'
+            "$ORACLE_USER@$ORACLE_HOST" "bash -s -- '$GITHUB_SHA'" <<'REMOTE'
           set -euo pipefail
 
+          EXPECTED_SHA="$1"
           APP_DIR="$HOME/bot"
-          ENV_FILE="$APP_DIR/.env"
+          ENV_FILE="$HOME/igbot.env"
+          COOKIE_FILE="$HOME/igbot-cookies.txt"
+          CONTAINER="igbot"
+          PREVIOUS_CONTAINER="igbot-previous"
+          CANDIDATE_IMAGE="igbot:$EXPECTED_SHA"
+          WORK_DIR="$(mktemp -d "$HOME/igbot-deploy.XXXXXX")"
+
+          cleanup_workdir() {
+            rm -rf -- "$WORK_DIR"
+          }
+          trap cleanup_workdir EXIT
 
           if [ ! -d "$APP_DIR/.git" ]; then
             echo "Repository not found at $APP_DIR." >&2
@@ -94,20 +113,90 @@ jobs:
             echo "Missing $ENV_FILE." >&2
             exit 1
           fi
+          if [ ! -s "$COOKIE_FILE" ]; then
+            echo "Missing or empty $COOKIE_FILE." >&2
+            exit 1
+          fi
           grep -qE '^BOT_TOKEN=.+$' "$ENV_FILE" || {
             echo "BOT_TOKEN is missing from $ENV_FILE." >&2
             exit 1
           }
-
-          # Use the VM's established updater so deployment keeps its image name,
-          # container name, environment file, and cookie mount in sync.
-          cd "$HOME"
-          ./update.sh bot
-          if [ "$(sudo docker inspect -f '{{.State.Running}}' tgbot)" != "true" ]; then
-            echo "Container tgbot is not running after update." >&2
-            sudo docker logs --tail 80 tgbot >&2 || true
+          grep -qE '^ALLOWED_USER_IDS=[0-9]+(,[0-9]+)*$' "$ENV_FILE" || {
+            echo "ALLOWED_USER_IDS is missing or malformed in $ENV_FILE." >&2
             exit 1
+          }
+          grep -qx 'COOKIES_FILE=/data/cookies.txt' "$ENV_FILE" || {
+            echo "COOKIES_FILE must point to /data/cookies.txt in $ENV_FILE." >&2
+            exit 1
+          }
+
+          git -C "$APP_DIR" diff --quiet
+          git -C "$APP_DIR" diff --cached --quiet
+          git -C "$APP_DIR" fetch --quiet origin main
+          git -C "$APP_DIR" cat-file -e "$EXPECTED_SHA^{commit}"
+          git -C "$APP_DIR" archive "$EXPECTED_SHA" | tar -x -C "$WORK_DIR"
+
+          sudo docker build --pull \
+            --label "org.opencontainers.image.revision=$EXPECTED_SHA" \
+            -t "$CANDIDATE_IMAGE" "$WORK_DIR"
+
+          rollback() {
+            status=$?
+            trap - ERR
+            echo "Deployment failed; restoring previous $CONTAINER container." >&2
+            sudo docker logs --tail 80 "$CONTAINER" >&2 || true
+            sudo docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+            if sudo docker inspect "$PREVIOUS_CONTAINER" >/dev/null 2>&1; then
+              sudo docker rename "$PREVIOUS_CONTAINER" "$CONTAINER"
+              sudo docker start "$CONTAINER" >/dev/null
+            fi
+            exit "$status"
+          }
+
+          sudo docker rm -f "$PREVIOUS_CONTAINER" >/dev/null 2>&1 || true
+          if sudo docker inspect "$CONTAINER" >/dev/null 2>&1; then
+            sudo docker stop "$CONTAINER" >/dev/null
+            sudo docker rename "$CONTAINER" "$PREVIOUS_CONTAINER"
           fi
-          echo "Deployment successful: tgbot"
-          sudo docker ps --filter "name=^/tgbot$" --format 'table {{.Names}}\t{{.Status}}'
+
+          trap rollback ERR
+          sudo docker run -d \
+            --name "$CONTAINER" \
+            --restart unless-stopped \
+            --env-file "$ENV_FILE" \
+            -v "$COOKIE_FILE:/data/cookies.txt:ro" \
+            "$CANDIDATE_IMAGE" >/dev/null
+
+          sleep 8
+          [ "$(sudo docker inspect -f '{{.State.Running}}' "$CONTAINER")" = "true" ]
+          [ "$(sudo docker inspect -f '{{.RestartCount}}' "$CONTAINER")" = "0" ]
+          [ "$(sudo docker inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$CONTAINER")" = "$EXPECTED_SHA" ]
+
+          sudo docker exec -i "$CONTAINER" python - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          token = os.environ["BOT_TOKEN"]
+          with urllib.request.urlopen(
+              f"https://api.telegram.org/bot{token}/getMe", timeout=15
+          ) as response:
+              result = json.load(response)
+          username = result.get("result", {}).get("username")
+          if not result.get("ok") or username != "InstaFBOfficial_bot":
+              raise SystemExit("Telegram getMe validation failed")
+          print(f"Telegram identity verified: @{username}")
+          PY
+
+          sleep 10
+          [ "$(sudo docker inspect -f '{{.State.Running}}' "$CONTAINER")" = "true" ]
+          [ "$(sudo docker inspect -f '{{.RestartCount}}' "$CONTAINER")" = "0" ]
+
+          trap - ERR
+          sudo docker rm "$PREVIOUS_CONTAINER" >/dev/null 2>&1 || true
+          sudo docker tag "$CANDIDATE_IMAGE" igbot:latest
+
+          echo "Deployment successful: $CONTAINER at $EXPECTED_SHA"
+          sudo docker ps --filter "name=^/$CONTAINER$" --format 'table {{.Names}}\t{{.Status}}'
           REMOTE
+
