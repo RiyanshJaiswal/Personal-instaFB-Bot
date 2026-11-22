@@ -1,0 +1,65 @@
+name: PR validation (no deployment)
+
+on:
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Python smoke tests and Docker build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Compile Python files
+        run: python -m compileall -q bot.py profile_feature.py
+
+      - name: Import and feature smoke tests
+        run: |
+          python - <<'PY'
+          import bot
+          import profile_feature as pf
+
+          assert callable(pf.register)
+          assert pf.extract_username("https://www.instagram.com/example/") == "example"
+          assert pf.extract_username("https://www.instagram.com/reel/ABC123/") is None
+
+          row = "ABC123\\t1\\tNone\\thttps://cdn.example/image.jpg\\t12\\texample\\t\\"Example User\\"\\t\\"caption\\""
+          parsed = pf.parse_line(row)
+          assert parsed is not None
+          assert parsed["code"] == "ABC123"
+          assert parsed["total"] == 12
+          assert parsed["description"] == "caption"
+
+          posts = [
+              pf.Post(code="VIDEO1", files=[("https://cdn.example/video.mp4", None)]),
+              pf.Post(code="IMAGE1", files=[(None, "https://cdn.example/image.jpg")]),
+              pf.Post(code="MIXED1", files=[("https://cdn.example/video.mp4", None), (None, "https://cdn.example/image.jpg")]),
+          ]
+          stats = pf.summarize(posts)
+          assert stats == {"videos": 1, "images": 2, "carousels": 1, "mixed": 1}
+          assert [p.code for p in pf.select_posts(posts, "video", None)] == ["VIDEO1"]
+          assert [p.code for p in pf.select_posts(posts, "image", None)] == ["IMAGE1", "MIXED1"]
+          assert [p.code for p in pf.select_posts(posts, "both", 2)] == ["VIDEO1", "IMAGE1"]
+
+          print("Import, URL parsing, metadata parsing, classification and selection smoke tests passed.")
+          PY
+
+      - name: Build Docker image
+        run: docker build --pull -t personal-instafb-bot:pr-test .
